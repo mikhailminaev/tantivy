@@ -1,9 +1,10 @@
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
 
 use common::BitSet;
+use crossbeam_channel as channel;
 use smallvec::smallvec;
 
 use super::operation::{AddOperation, UserOperation};
@@ -87,11 +88,157 @@ pub struct IndexWriter<D: Document = TantivyDocument> {
 
     worker_id: usize,
     publication_generation: PublicationGeneration,
+    seal_reaper: SealReaper,
+    pending_seals: Vec<Arc<SealCompletion>>,
 
     delete_queue: DeleteQueue,
 
     stamper: Stamper,
     committed_opstamp: Opstamp,
+}
+
+enum SealStatus {
+    Pending,
+    Complete(Result<(), String>),
+}
+
+struct SealCompletion {
+    status: Mutex<SealStatus>,
+    completed: Condvar,
+}
+
+impl SealCompletion {
+    fn new() -> Self {
+        Self {
+            status: Mutex::new(SealStatus::Pending),
+            completed: Condvar::new(),
+        }
+    }
+
+    fn complete(&self, result: Result<(), String>) {
+        let mut status = self.status.lock().expect("seal completion lock poisoned");
+        *status = SealStatus::Complete(result);
+        self.completed.notify_all();
+    }
+
+    fn wait(&self) -> crate::Result<()> {
+        let mut status = self.status.lock().expect("seal completion lock poisoned");
+        loop {
+            match &*status {
+                SealStatus::Pending => {
+                    status = self
+                        .completed
+                        .wait(status)
+                        .expect("seal completion lock poisoned");
+                }
+                SealStatus::Complete(Ok(())) => return Ok(()),
+                SealStatus::Complete(Err(message)) => {
+                    return Err(TantivyError::ErrorInThread(message.clone()));
+                }
+            }
+        }
+    }
+}
+
+struct SealWork {
+    completion: Arc<SealCompletion>,
+    workers: Vec<JoinHandle<crate::Result<()>>>,
+}
+
+struct SealReaper {
+    sender: Option<channel::Sender<SealWork>>,
+    join_handle: Option<JoinHandle<()>>,
+}
+
+impl SealReaper {
+    fn new() -> crate::Result<Self> {
+        let (sender, receiver) = channel::bounded::<SealWork>(1);
+        let join_handle = thread::Builder::new()
+            .name("thrd-tantivy-seal-reaper".to_string())
+            .spawn(move || {
+                for work in receiver {
+                    let result = wait_for_workers(work.workers);
+                    work.completion.complete(result);
+                }
+            })
+            .map_err(|error| {
+                TantivyError::SystemError(format!("failed to spawn seal reaper thread: {error}"))
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            join_handle: Some(join_handle),
+        })
+    }
+
+    fn submit(&self, work: SealWork) -> Result<(), SealWork> {
+        match &self.sender {
+            Some(sender) => sender.send(work).map_err(|error| error.into_inner()),
+            None => Err(work),
+        }
+    }
+
+    fn close_and_join(&mut self) -> crate::Result<()> {
+        self.sender.take();
+        if let Some(join_handle) = self.join_handle.take() {
+            join_handle
+                .join()
+                .map_err(|_| error_in_index_worker_thread("Seal reaper thread panicked."))?;
+        }
+        Ok(())
+    }
+}
+
+fn wait_for_workers(workers: Vec<JoinHandle<crate::Result<()>>>) -> Result<(), String> {
+    for worker in workers {
+        let worker_result = worker
+            .join()
+            .map_err(|error| format!("indexing worker panicked: {error:?}"))?;
+        worker_result.map_err(|error| format!("indexing worker failed: {error}"))?;
+    }
+    Ok(())
+}
+
+/// A bounded writer generation that has been cut from the active indexing pipeline.
+///
+/// `seal` switches the writer to a successor generation before returning. The old workers finish
+/// in the background; a caller waits only for this generation and can then materialize an exact
+/// immutable searcher without a durable commit.
+#[must_use = "a sealed generation must be waited for or accounted for by a later durable commit"]
+pub struct SealedGeneration {
+    completion: Arc<SealCompletion>,
+    segment_updater: SegmentUpdater,
+    generation: PublicationGeneration,
+    opstamp: Opstamp,
+}
+
+/// A sealed generation whose indexing workers have finished.
+pub struct CompletedGeneration {
+    segment_updater: SegmentUpdater,
+    generation: PublicationGeneration,
+    opstamp: Opstamp,
+}
+
+impl SealedGeneration {
+    /// Waits for all workers in this generation to finish writing their segments.
+    pub fn wait(self) -> crate::Result<CompletedGeneration> {
+        self.completion.wait()?;
+        Ok(CompletedGeneration {
+            segment_updater: self.segment_updater,
+            generation: self.generation,
+            opstamp: self.opstamp,
+        })
+    }
+}
+
+impl CompletedGeneration {
+    /// Opens the complete immutable searcher for this generation without persisting it.
+    pub fn open_searcher(&self, reader: &crate::reader::IndexReader) -> crate::Result<crate::Searcher> {
+        let segment_readers = self
+            .segment_updater
+            .schedule_snapshot_segment_readers_through_generation(self.opstamp, self.generation)
+            .wait()?;
+        reader.searcher_for_segment_readers(segment_readers)
+    }
 }
 
 fn compute_deleted_bitset(
@@ -356,6 +503,8 @@ impl<D: Document> IndexWriter<D> {
 
             worker_id: 0,
             publication_generation: PublicationGeneration::new(0),
+            seal_reaper: SealReaper::new()?,
+            pending_seals: Vec::new(),
         };
         index_writer.start_workers()?;
         Ok(index_writer)
@@ -385,6 +534,9 @@ impl<D: Document> IndexWriter<D> {
                 .map_err(|_| error_in_index_worker_thread("Worker thread panicked."))?
                 .map_err(|_| error_in_index_worker_thread("Worker thread failed."))?;
         }
+
+        self.wait_for_sealed_generations()?;
+        self.seal_reaper.close_and_join()?;
 
         let result = self
             .segment_updater
@@ -577,6 +729,17 @@ impl<D: Document> IndexWriter<D> {
         self.index_writer_status = IndexWriterStatus::from(document_receiver);
     }
 
+    fn wait_for_sealed_generations(&mut self) -> crate::Result<()> {
+        let pending_seals = std::mem::take(&mut self.pending_seals);
+        let mut first_error = None;
+        for completion in pending_seals {
+            if let Err(error) = completion.wait() {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     /// Rollback to the last commit
     ///
     /// This cancels all of the updates that
@@ -587,6 +750,7 @@ impl<D: Document> IndexWriter<D> {
     /// The opstamp at the last commit is returned.
     pub fn rollback(&mut self) -> crate::Result<Opstamp> {
         info!("Rolling back to opstamp {}", self.committed_opstamp);
+        self.wait_for_sealed_generations()?;
         // marks the segment updater as killed. From now on, all
         // segment updates will be ignored.
         self.segment_updater.kill();
@@ -651,6 +815,7 @@ impl<D: Document> IndexWriter<D> {
         // This will move uncommitted segments to the state of
         // committed segments.
         info!("Preparing commit");
+        self.wait_for_sealed_generations()?;
 
         // this will drop the current document channel
         // and recreate a new one.
@@ -677,6 +842,47 @@ impl<D: Document> IndexWriter<D> {
         let prepared_commit = PreparedCommit::new(self, commit_opstamp, prepared_generation);
         info!("Prepared commit {commit_opstamp}");
         Ok(prepared_commit)
+    }
+
+    /// Cuts the active indexing pipeline and starts its successor without waiting for the cut
+    /// generation to finish.
+    ///
+    /// The returned generation contains exactly operations accepted before the cut. Its workers
+    /// are reaped on one long-lived thread while this writer immediately accepts new operations in
+    /// the successor generation. A normal [`Self::commit`] or [`Self::rollback`] waits for every
+    /// outstanding sealed generation before changing durable state.
+    pub fn seal(&mut self) -> crate::Result<SealedGeneration> {
+        let generation = self.publication_generation;
+        let successor_generation = generation.next().ok_or_else(|| {
+            TantivyError::InvalidArgument("publication generation counter exhausted".to_string())
+        })?;
+        let opstamp = self.stamper.stamp();
+
+        self.recreate_document_channel();
+        let workers = std::mem::take(&mut self.workers_join_handle);
+        self.publication_generation = successor_generation;
+        self.start_workers()?;
+
+        let completion = Arc::new(SealCompletion::new());
+        let work = SealWork {
+            completion: completion.clone(),
+            workers,
+        };
+        if let Err(work) = self.seal_reaper.submit(work) {
+            let result = wait_for_workers(work.workers);
+            completion.complete(result);
+            return Err(TantivyError::ErrorInThread(
+                "seal reaper is unavailable".to_string(),
+            ));
+        }
+        self.pending_seals.push(completion.clone());
+
+        Ok(SealedGeneration {
+            completion,
+            segment_updater: self.segment_updater.clone(),
+            generation,
+            opstamp,
+        })
     }
 
     /// Commits all of the pending changes
@@ -937,6 +1143,74 @@ mod tests {
 
         let after_delete_opstamp = index.load_metas().unwrap().segments[0].delete_opstamp();
         assert_eq!(after_delete_opstamp, previous_delete_opstamp);
+    }
+
+    #[test]
+    fn seal_excludes_a_completed_successor_generation() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let title = schema_builder.add_text_field("title", TEXT | STORED);
+        let index = Index::create_in_ram(schema_builder.build());
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+        let mut writer = index.writer_for_tests()?;
+
+        writer.add_document(doc!(title => "first"))?;
+        let first_seal = writer.seal()?;
+
+        writer.add_document(doc!(title => "second"))?;
+        let second_generation = writer.seal()?.wait()?;
+        let first_generation = first_seal.wait()?;
+
+        let first_query = TermQuery::new(
+            Term::from_field_text(title, "first"),
+            IndexRecordOption::Basic,
+        );
+        let second_query = TermQuery::new(
+            Term::from_field_text(title, "second"),
+            IndexRecordOption::Basic,
+        );
+
+        let first_searcher = first_generation.open_searcher(&reader)?;
+        assert_eq!(first_searcher.search(&first_query, &Count)?, 1);
+        assert_eq!(first_searcher.search(&second_query, &Count)?, 0);
+
+        let second_searcher = second_generation.open_searcher(&reader)?;
+        assert_eq!(second_searcher.search(&first_query, &Count)?, 1);
+        assert_eq!(second_searcher.search(&second_query, &Count)?, 1);
+
+        writer.commit()?;
+        reader.reload()?;
+        assert_eq!(reader.searcher().search(&first_query, &Count)?, 1);
+        assert_eq!(reader.searcher().search(&second_query, &Count)?, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn commit_waits_for_an_unobserved_sealed_generation() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let title = schema_builder.add_text_field("title", TEXT | STORED);
+        let index = Index::create_in_ram(schema_builder.build());
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+        let mut writer = index.writer_for_tests()?;
+
+        writer.add_document(doc!(title => "sealed"))?;
+        let _seal = writer.seal()?;
+
+        writer.commit()?;
+        reader.reload()?;
+
+        let query = TermQuery::new(
+            Term::from_field_text(title, "sealed"),
+            IndexRecordOption::Basic,
+        );
+        assert_eq!(reader.searcher().search(&query, &Count)?, 1);
+        Ok(())
     }
 
     #[test]
