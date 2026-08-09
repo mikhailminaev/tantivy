@@ -185,19 +185,28 @@ impl InnerIndexReader {
             searcher_generation_inventory,
         })
     }
-    /// Opens the freshest segments [`SegmentReader`].
+    /// Opens segment readers for a fixed set of segments.
     ///
-    /// This function acquires a lock to prevent GC from removing files
-    /// as we are opening our index.
-    fn open_segment_readers(index: &Index) -> crate::Result<Vec<SegmentReader>> {
+    /// This function acquires a lock to prevent garbage collection from removing files while
+    /// their readers are being opened. The resulting searcher keeps the segment generation alive
+    /// through Tantivy's inventory, so the lock only needs to cover construction.
+    fn open_segment_readers_for_segments(
+        index: &Index,
+        segments: &[crate::index::Segment],
+    ) -> crate::Result<Vec<SegmentReader>> {
         // Prevents segment files from getting deleted while we are in the process of opening them
         let _meta_lock = index.directory().acquire_lock(&META_LOCK)?;
-        let searchable_segments = index.searchable_segments()?;
-        let segment_readers = searchable_segments
+        let segment_readers = segments
             .iter()
             .map(SegmentReader::open)
             .collect::<crate::Result<_>>()?;
         Ok(segment_readers)
+    }
+
+    /// Opens readers for the latest committed segments.
+    fn open_segment_readers(index: &Index) -> crate::Result<Vec<SegmentReader>> {
+        let searchable_segments = index.searchable_segments()?;
+        Self::open_segment_readers_for_segments(index, &searchable_segments)
     }
 
     fn track_segment_readers_in_inventory(
@@ -236,6 +245,34 @@ impl InnerIndexReader {
 
         warming_state.warm_new_searcher_generation(&searcher.clone().into())?;
         Ok(searcher)
+    }
+
+    /// Builds a searcher over exactly `segments`, without consulting `meta.json`.
+    ///
+    /// A caller must obtain the segments from a coherent publication barrier. This primitive is
+    /// deliberately separate from `reload`: it materialises an immutable view, but does not
+    /// replace the searcher currently held by this reader.
+    fn create_searcher_for_segments(
+        &self,
+        segments: &[crate::index::Segment],
+    ) -> crate::Result<Searcher> {
+        let segment_readers =
+            Self::open_segment_readers_for_segments(&self.index, segments)?;
+        let searcher_generation = Self::track_segment_readers_in_inventory(
+            &segment_readers,
+            &self.searcher_generation_counter,
+            &self.searcher_generation_inventory,
+        );
+        let searcher = Arc::new(SearcherInner::new(
+            self.index.schema(),
+            self.index.clone(),
+            segment_readers,
+            searcher_generation,
+            self.doc_store_cache_num_blocks,
+        )?);
+        self.warming_state
+            .warm_new_searcher_generation(&searcher.clone().into())?;
+        Ok(searcher.into())
     }
 
     fn reload(&self) -> crate::Result<()> {
@@ -297,5 +334,57 @@ impl IndexReader {
     /// the use of a consistent segment set.
     pub fn searcher(&self) -> Searcher {
         self.inner.searcher()
+    }
+
+    /// Opens an immutable searcher over exactly `segments`.
+    ///
+    /// This does not read or write `meta.json` and does not change the reader's current searcher.
+    /// It is intended for an indexer that has already established a complete publication barrier.
+    /// Passing an arbitrary mixture of segment versions is invalid and may produce an incoherent
+    /// index view.
+    ///
+    /// Normal Tantivy consumers should use [`Self::searcher`] and [`Self::reload`].
+    pub fn searcher_for_segments(
+        &self,
+        segments: &[crate::index::Segment],
+    ) -> crate::Result<Searcher> {
+        self.inner.create_searcher_for_segments(segments)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::collector::Count;
+    use crate::query::AllQuery;
+    use crate::schema::{Schema, STORED, TEXT};
+    use crate::Index;
+
+    use super::ReloadPolicy;
+
+    #[test]
+    fn searcher_for_segments_keeps_the_explicit_snapshot() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let title = schema_builder.add_text_field("title", TEXT | STORED);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer = index.writer_for_tests()?;
+
+        writer.add_document(doc!(title => "first generation"))?;
+        writer.commit()?;
+        let first_generation_segments = index.searchable_segments()?;
+
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+
+        writer.add_document(doc!(title => "second generation"))?;
+        writer.commit()?;
+        reader.reload()?;
+
+        let first_generation = reader.searcher_for_segments(&first_generation_segments)?;
+        assert_eq!(first_generation.search(&AllQuery, &Count)?, 1);
+        assert_eq!(reader.searcher().search(&AllQuery, &Count)?, 2);
+
+        Ok(())
     }
 }
