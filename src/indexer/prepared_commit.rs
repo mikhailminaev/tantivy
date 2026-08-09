@@ -1,6 +1,7 @@
 use super::IndexWriter;
+use crate::reader::IndexReader;
 use crate::schema::document::Document;
-use crate::{FutureResult, Opstamp, TantivyDocument};
+use crate::{FutureResult, Opstamp, Searcher, TantivyDocument};
 
 /// A prepared commit
 pub struct PreparedCommit<'a, D: Document = TantivyDocument> {
@@ -28,6 +29,27 @@ impl<'a, D: Document> PreparedCommit<'a, D> {
         self.payload = Some(payload.to_string())
     }
 
+    /// Opens an immutable searcher for this prepared commit without persisting it.
+    ///
+    /// The prepared-commit boundary guarantees that all add operations through this commit's
+    /// opstamp have finished indexing and that no later add operation can enter the snapshot.
+    /// Deletes through the same opstamp are applied before the searcher is opened. The returned
+    /// searcher is independent of `reader`'s current searcher and opening it does not write
+    /// `meta.json` or make the commit durable.
+    ///
+    /// This is intended for a publisher that atomically installs a complete immutable read
+    /// generation before handing the same prefix to durable commit processing. Calling
+    /// [`Self::abort`] after publishing such a searcher is invalid: it would discard the logical
+    /// writer state represented by the published view.
+    pub fn open_searcher(&self, reader: &IndexReader) -> crate::Result<Searcher> {
+        let segment_readers = self
+            .index_writer
+            .segment_updater()
+            .schedule_snapshot_segment_readers(self.opstamp)
+            .wait()?;
+        reader.searcher_for_segment_readers(segment_readers)
+    }
+
     /// Rollbacks any change.
     pub fn abort(self) -> crate::Result<Opstamp> {
         self.index_writer.rollback()
@@ -49,5 +71,57 @@ impl<'a, D: Document> PreparedCommit<'a, D> {
         self.index_writer
             .segment_updater()
             .schedule_commit(self.opstamp, self.payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::collector::Count;
+    use crate::query::TermQuery;
+    use crate::reader::ReloadPolicy;
+    use crate::schema::{IndexRecordOption, Schema, STORED, TEXT};
+    use crate::{Index, Term};
+
+    #[test]
+    fn open_searcher_applies_replacement_before_durable_commit() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let title = schema_builder.add_text_field("title", TEXT | STORED);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer = index.writer_for_tests()?;
+
+        writer.add_document(doc!(title => "before"))?;
+        writer.commit()?;
+
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+
+        writer.delete_term(Term::from_field_text(title, "before"));
+        writer.add_document(doc!(title => "after"))?;
+
+        let prepared_commit = writer.prepare_commit()?;
+        let prepared_searcher = prepared_commit.open_searcher(&reader)?;
+
+        let before_query = TermQuery::new(
+            Term::from_field_text(title, "before"),
+            IndexRecordOption::Basic,
+        );
+        let after_query = TermQuery::new(
+            Term::from_field_text(title, "after"),
+            IndexRecordOption::Basic,
+        );
+
+        assert_eq!(prepared_searcher.search(&before_query, &Count)?, 0);
+        assert_eq!(prepared_searcher.search(&after_query, &Count)?, 1);
+        assert_eq!(reader.searcher().search(&before_query, &Count)?, 1);
+        assert_eq!(reader.searcher().search(&after_query, &Count)?, 0);
+
+        prepared_commit.commit()?;
+        reader.reload()?;
+        assert_eq!(reader.searcher().search(&before_query, &Count)?, 0);
+        assert_eq!(reader.searcher().search(&after_query, &Count)?, 1);
+
+        Ok(())
     }
 }

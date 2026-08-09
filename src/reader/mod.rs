@@ -258,6 +258,13 @@ impl InnerIndexReader {
     ) -> crate::Result<Searcher> {
         let segment_readers =
             Self::open_segment_readers_for_segments(&self.index, segments)?;
+        self.create_searcher_for_segment_readers(segment_readers)
+    }
+
+    fn create_searcher_for_segment_readers(
+        &self,
+        segment_readers: Vec<SegmentReader>,
+    ) -> crate::Result<Searcher> {
         let searcher_generation = Self::track_segment_readers_in_inventory(
             &segment_readers,
             &self.searcher_generation_counter,
@@ -349,6 +356,13 @@ impl IndexReader {
         segments: &[crate::index::Segment],
     ) -> crate::Result<Searcher> {
         self.inner.create_searcher_for_segments(segments)
+    }
+
+    pub(crate) fn searcher_for_segment_readers(
+        &self,
+        segment_readers: Vec<SegmentReader>,
+    ) -> crate::Result<Searcher> {
+        self.inner.create_searcher_for_segment_readers(segment_readers)
     }
 }
 

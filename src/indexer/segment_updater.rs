@@ -13,9 +13,9 @@ use super::segment_manager::SegmentManager;
 use crate::core::META_FILEPATH;
 use crate::directory::{Directory, DirectoryClone, GarbageCollectionResult};
 use crate::fastfield::AliveBitSet;
-use crate::index::{Index, IndexMeta, IndexSettings, Segment, SegmentId, SegmentMeta};
+use crate::index::{Index, IndexMeta, IndexSettings, Segment, SegmentId, SegmentMeta, SegmentReader};
 use crate::indexer::delete_queue::DeleteCursor;
-use crate::indexer::index_writer::advance_deletes;
+use crate::indexer::index_writer::{advance_deletes, compute_alive_bitset};
 use crate::indexer::merge_operation::MergeOperationInventory;
 use crate::indexer::merger::IndexMerger;
 use crate::indexer::segment_manager::SegmentsStatus;
@@ -351,6 +351,36 @@ impl SegmentUpdater {
             segment_updater.segment_manager.add_segment(segment_entry);
             segment_updater.consider_merge_options();
             Ok(())
+        })
+    }
+
+    /// Returns readers for the complete segment set as it exists at `target_opstamp` without
+    /// committing it.
+    ///
+    /// Deletes through the target are held in reader-local overlays; the segment manager, `.del`
+    /// files and durable `meta.json` remain unchanged. Callers must establish their own publication
+    /// barrier before invoking this method: later add operations are not filtered from the snapshot.
+    pub(crate) fn schedule_snapshot_segment_readers(
+        &self,
+        target_opstamp: Opstamp,
+    ) -> FutureResult<Vec<SegmentReader>> {
+        let segment_updater = self.clone();
+        self.schedule_task(move || {
+            segment_updater
+                .segment_manager
+                .segment_entries()
+                .into_iter()
+                .map(|mut segment_entry| {
+                    let segment = segment_updater.index.segment(segment_entry.meta().clone());
+                    let custom_alive_set = compute_alive_bitset(
+                        &segment,
+                        &mut segment_entry,
+                        target_opstamp,
+                    )?
+                    .map(AliveBitSet::from_bitset);
+                    SegmentReader::open_with_custom_alive_set(&segment, custom_alive_set)
+                })
+                .collect::<crate::Result<_>>()
         })
     }
 

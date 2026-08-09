@@ -128,30 +128,33 @@ fn compute_deleted_bitset(
 /// is `==` target_opstamp.
 /// For instance, there was no delete operation between the state of the `segment_entry` and
 /// the `target_opstamp`, `segment_entry` is not updated.
-pub fn advance_deletes(
-    mut segment: Segment,
+/// Computes the delete overlay required to advance one segment to `target_opstamp`.
+///
+/// The returned bitset is independent of the segment's durable delete file. Callers that build an
+/// immutable snapshot may pass it to `SegmentReader::open_with_custom_alive_set`; callers that
+/// make a durable commit may materialize it through [`advance_deletes`].
+pub(crate) fn compute_alive_bitset(
+    segment: &Segment,
     segment_entry: &mut SegmentEntry,
     target_opstamp: Opstamp,
-) -> crate::Result<()> {
+) -> crate::Result<Option<BitSet>> {
     if segment_entry.meta().delete_opstamp() == Some(target_opstamp) {
         // We are already up-to-date here.
-        return Ok(());
+        return Ok(None);
     }
 
     if segment_entry.alive_bitset().is_none() && segment_entry.delete_cursor().get().is_none() {
         // There has been no `DeleteOperation` between the segment status and `target_opstamp`.
-        return Ok(());
+        return Ok(None);
     }
 
-    let segment_reader = SegmentReader::open(&segment)?;
+    let segment_reader = SegmentReader::open(segment)?;
 
     let max_doc = segment_reader.max_doc();
     let mut alive_bitset: BitSet = match segment_entry.alive_bitset() {
         Some(previous_alive_bitset) => (*previous_alive_bitset).clone(),
         None => BitSet::with_max_value_and_full(max_doc),
     };
-
-    let num_deleted_docs_before = segment.meta().num_deleted_docs();
 
     compute_deleted_bitset(
         &mut alive_bitset,
@@ -165,16 +168,26 @@ pub fn advance_deletes(
         alive_bitset.intersect_update(seg_alive_bitset.bitset());
     }
 
-    let num_alive_docs: u32 = alive_bitset.len() as u32;
-    let num_deleted_docs = max_doc - num_alive_docs;
-    if num_deleted_docs > num_deleted_docs_before {
-        // There are new deletes. We need to write a new delete file.
-        segment = segment.with_delete_meta(num_deleted_docs, target_opstamp);
-        let mut alive_doc_file = segment.open_write(SegmentComponent::Delete)?;
-        write_alive_bitset(&alive_bitset, &mut alive_doc_file)?;
-        alive_doc_file.terminate()?;
-    }
+    let num_deleted_docs = max_doc - alive_bitset.len() as u32;
+    Ok((num_deleted_docs > segment.meta().num_deleted_docs()).then_some(alive_bitset))
+}
 
+/// Advance delete for the given segment up to the target opstamp and persist the resulting
+/// delete file when the segment changed.
+pub fn advance_deletes(
+    mut segment: Segment,
+    segment_entry: &mut SegmentEntry,
+    target_opstamp: Opstamp,
+) -> crate::Result<()> {
+    let Some(alive_bitset) = compute_alive_bitset(&segment, segment_entry, target_opstamp)? else {
+        return Ok(());
+    };
+
+    let num_deleted_docs = segment.meta().max_doc() - alive_bitset.len() as u32;
+    segment = segment.with_delete_meta(num_deleted_docs, target_opstamp);
+    let mut alive_doc_file = segment.open_write(SegmentComponent::Delete)?;
+    write_alive_bitset(&alive_bitset, &mut alive_doc_file)?;
+    alive_doc_file.terminate()?;
     segment_entry.set_meta(segment.meta().clone());
     Ok(())
 }

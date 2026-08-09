@@ -35,6 +35,17 @@ pub fn intersect_alive_bitsets(left: AliveBitSet, right: AliveBitSet) -> AliveBi
 }
 
 impl AliveBitSet {
+    /// Builds an in-memory alive set from a mutable bitset.
+    ///
+    /// The serialized representation is intentionally owned by this value. It is used for
+    /// immutable reader-local delete overlays and is never written to a segment's `.del` file.
+    pub(crate) fn from_bitset(bitset: BitSet) -> AliveBitSet {
+        let mut bytes = Vec::new();
+        write_alive_bitset(&bitset, &mut bytes)
+            .expect("writing an alive bitset into a Vec cannot fail");
+        AliveBitSet::open(OwnedBytes::new(bytes))
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test_from_deleted_docs(deleted_docs: &[DocId], max_doc: u32) -> AliveBitSet {
         assert!(deleted_docs.iter().all(|&doc| doc < max_doc));
