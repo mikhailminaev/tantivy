@@ -1,6 +1,7 @@
 use super::IndexWriter;
 use crate::reader::IndexReader;
 use crate::schema::document::Document;
+use crate::indexer::segment_entry::PublicationGeneration;
 use crate::{FutureResult, Opstamp, Searcher, TantivyDocument};
 
 /// A prepared commit
@@ -8,14 +9,20 @@ pub struct PreparedCommit<'a, D: Document = TantivyDocument> {
     index_writer: &'a mut IndexWriter<D>,
     payload: Option<String>,
     opstamp: Opstamp,
+    publication_generation: PublicationGeneration,
 }
 
 impl<'a, D: Document> PreparedCommit<'a, D> {
-    pub(crate) fn new(index_writer: &'a mut IndexWriter<D>, opstamp: Opstamp) -> Self {
+    pub(crate) fn new(
+        index_writer: &'a mut IndexWriter<D>,
+        opstamp: Opstamp,
+        publication_generation: PublicationGeneration,
+    ) -> Self {
         Self {
             index_writer,
             payload: None,
             opstamp,
+            publication_generation,
         }
     }
 
@@ -45,7 +52,10 @@ impl<'a, D: Document> PreparedCommit<'a, D> {
         let segment_readers = self
             .index_writer
             .segment_updater()
-            .schedule_snapshot_segment_readers(self.opstamp)
+            .schedule_snapshot_segment_readers_through_generation(
+                self.opstamp,
+                self.publication_generation,
+            )
             .wait()?;
         reader.searcher_for_segment_readers(segment_readers)
     }

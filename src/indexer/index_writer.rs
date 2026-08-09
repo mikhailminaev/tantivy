@@ -17,6 +17,7 @@ use crate::indexer::delete_queue::{DeleteCursor, DeleteQueue};
 use crate::indexer::doc_opstamp_mapping::DocToOpstampMapping;
 use crate::indexer::index_writer_status::IndexWriterStatus;
 use crate::indexer::operation::DeleteOperation;
+use crate::indexer::segment_entry::PublicationGeneration;
 use crate::indexer::stamper::Stamper;
 use crate::indexer::{MergePolicy, SegmentEntry, SegmentWriter};
 use crate::query::{EnableScoring, Query, TermQuery};
@@ -85,6 +86,7 @@ pub struct IndexWriter<D: Document = TantivyDocument> {
     segment_updater: SegmentUpdater,
 
     worker_id: usize,
+    publication_generation: PublicationGeneration,
 
     delete_queue: DeleteQueue,
 
@@ -198,6 +200,7 @@ fn index_documents<D: Document>(
     grouped_document_iterator: &mut dyn Iterator<Item = AddBatch<D>>,
     segment_updater: &SegmentUpdater,
     mut delete_cursor: DeleteCursor,
+    publication_generation: PublicationGeneration,
 ) -> crate::Result<()> {
     let mut segment_writer = SegmentWriter::for_segment(memory_budget, segment.clone())?;
     for document_group in grouped_document_iterator {
@@ -233,7 +236,12 @@ fn index_documents<D: Document>(
     let meta = segment_with_max_doc.meta().clone();
 
     // update segment_updater inventory to remove tempstore
-    let segment_entry = SegmentEntry::new(meta, delete_cursor, alive_bitset_opt);
+    let segment_entry = SegmentEntry::new_for_publication(
+        meta,
+        delete_cursor,
+        alive_bitset_opt,
+        publication_generation,
+    );
     segment_updater.schedule_add_segment(segment_entry).wait()?;
     Ok(())
 }
@@ -347,6 +355,7 @@ impl<D: Document> IndexWriter<D> {
             stamper,
 
             worker_id: 0,
+            publication_generation: PublicationGeneration::new(0),
         };
         index_writer.start_workers()?;
         Ok(index_writer)
@@ -434,6 +443,7 @@ impl<D: Document> IndexWriter<D> {
 
         let mem_budget = self.options.memory_budget_per_thread;
         let index = self.index.clone();
+        let publication_generation = self.publication_generation;
         let join_handle: JoinHandle<crate::Result<()>> = thread::Builder::new()
             .name(format!("thrd-tantivy-index{}", self.worker_id))
             .spawn(move || {
@@ -466,6 +476,7 @@ impl<D: Document> IndexWriter<D> {
                         &mut document_iterator,
                         &segment_updater,
                         delete_cursor.clone(),
+                        publication_generation,
                     )?;
                 }
             })?;
@@ -643,9 +654,16 @@ impl<D: Document> IndexWriter<D> {
 
         // this will drop the current document channel
         // and recreate a new one.
+        let prepared_generation = self.publication_generation;
         self.recreate_document_channel();
 
         let former_workers_join_handle = std::mem::take(&mut self.workers_join_handle);
+
+        self.publication_generation = prepared_generation.next().ok_or_else(|| {
+            TantivyError::InvalidArgument(
+                "publication generation counter exhausted".to_string(),
+            )
+        })?;
 
         for worker_handle in former_workers_join_handle {
             let indexing_worker_result = worker_handle
@@ -656,7 +674,7 @@ impl<D: Document> IndexWriter<D> {
         }
 
         let commit_opstamp = self.stamper.stamp();
-        let prepared_commit = PreparedCommit::new(self, commit_opstamp);
+        let prepared_commit = PreparedCommit::new(self, commit_opstamp, prepared_generation);
         info!("Prepared commit {commit_opstamp}");
         Ok(prepared_commit)
     }

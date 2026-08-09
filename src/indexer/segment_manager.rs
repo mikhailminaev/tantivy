@@ -6,6 +6,7 @@ use super::segment_register::SegmentRegister;
 use crate::error::TantivyError;
 use crate::index::{SegmentId, SegmentMeta};
 use crate::indexer::delete_queue::DeleteCursor;
+use crate::indexer::segment_entry::PublicationGeneration;
 use crate::indexer::SegmentEntry;
 
 #[derive(Default)]
@@ -98,6 +99,34 @@ impl SegmentManager {
         segment_entries
     }
 
+    /// Returns the durable base plus only unpublished segments through `generation`.
+    ///
+    /// An unlabeled uncommitted segment cannot be safely assigned to a publication boundary, so
+    /// mixing legacy writer operations and generation-aware publication is rejected explicitly.
+    pub(crate) fn segment_entries_through_generation(
+        &self,
+        generation: PublicationGeneration,
+    ) -> crate::Result<Vec<SegmentEntry>> {
+        let registers_lock = self.read();
+        let mut segment_entries = registers_lock.committed.segment_entries();
+        for segment_entry in registers_lock.uncommitted.segment_entries() {
+            match segment_entry.publication_generation() {
+                Some(entry_generation) if entry_generation <= generation => {
+                    segment_entries.push(segment_entry);
+                }
+                Some(_) => {}
+                None => {
+                    return Err(TantivyError::InvalidArgument(
+                        "cannot snapshot a publication generation while unlabeled uncommitted \
+                         segments exist"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(segment_entries)
+    }
+
     // Lock poisoning should never happen :
     // The lock is acquired and released within this class,
     // and the operations cannot panic.
@@ -138,7 +167,8 @@ impl SegmentManager {
         let mut registers_lock = self.write();
         registers_lock.committed.clear();
         registers_lock.uncommitted.clear();
-        for segment_entry in segment_entries {
+        for mut segment_entry in segment_entries {
+            segment_entry.clear_publication_generation();
             registers_lock.committed.add_segment_entry(segment_entry);
         }
     }
@@ -172,6 +202,15 @@ impl SegmentManager {
                              committed."
                 .to_string();
             return Err(TantivyError::InvalidArgument(error_msg));
+        }
+
+        if segment_entries
+            .windows(2)
+            .any(|entries| entries[0].publication_generation() != entries[1].publication_generation())
+        {
+            return Err(TantivyError::InvalidArgument(
+                "cannot merge segments from different publication generations".to_string(),
+            ));
         }
 
         Ok(segment_entries)
@@ -218,5 +257,79 @@ impl SegmentManager {
         self.remove_empty_segments();
         let registers_lock = self.read();
         registers_lock.committed.segment_metas()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use crate::index::{SegmentId, SegmentMetaInventory};
+    use crate::indexer::delete_queue::DeleteQueue;
+    use crate::indexer::segment_entry::PublicationGeneration;
+    use crate::indexer::SegmentEntry;
+
+    use super::SegmentManager;
+
+    fn segment_entry(
+        inventory: &SegmentMetaInventory,
+        generation: Option<PublicationGeneration>,
+    ) -> SegmentEntry {
+        let meta = inventory.new_segment_meta(SegmentId::generate_random(), 1);
+        let delete_cursor = DeleteQueue::default().cursor();
+        match generation {
+            Some(generation) => SegmentEntry::new_for_publication(meta, delete_cursor, None, generation),
+            None => SegmentEntry::new(meta, delete_cursor, None),
+        }
+    }
+
+    #[test]
+    fn snapshot_through_generation_excludes_later_uncommitted_segments() -> crate::Result<()> {
+        let inventory = SegmentMetaInventory::default();
+        let delete_queue = DeleteQueue::default();
+        let durable = inventory.new_segment_meta(SegmentId::generate_random(), 1);
+        let manager = SegmentManager::from_segments(vec![durable.clone()], &delete_queue.cursor());
+        let first = segment_entry(&inventory, Some(PublicationGeneration::new(1)));
+        let second = segment_entry(&inventory, Some(PublicationGeneration::new(2)));
+        let expected_ids: HashSet<_> = [durable.id(), first.segment_id()].into_iter().collect();
+
+        manager.add_segment(first);
+        manager.add_segment(second);
+
+        let actual_ids: HashSet<_> = manager
+            .segment_entries_through_generation(PublicationGeneration::new(1))?
+            .into_iter()
+            .map(|entry| entry.segment_id())
+            .collect();
+
+        assert_eq!(actual_ids, expected_ids);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_through_generation_rejects_unlabeled_uncommitted_segments() {
+        let inventory = SegmentMetaInventory::default();
+        let manager = SegmentManager::default();
+        manager.add_segment(segment_entry(&inventory, None));
+
+        let error = manager
+            .segment_entries_through_generation(PublicationGeneration::new(1))
+            .unwrap_err();
+        assert!(error.to_string().contains("unlabeled uncommitted"));
+    }
+
+    #[test]
+    fn merging_different_publication_generations_is_rejected() {
+        let inventory = SegmentMetaInventory::default();
+        let manager = SegmentManager::default();
+        let first = segment_entry(&inventory, Some(PublicationGeneration::new(1)));
+        let second = segment_entry(&inventory, Some(PublicationGeneration::new(2)));
+        let ids = [first.segment_id(), second.segment_id()];
+
+        manager.add_segment(first);
+        manager.add_segment(second);
+
+        let error = manager.start_merge(&ids).unwrap_err();
+        assert!(error.to_string().contains("different publication generations"));
     }
 }

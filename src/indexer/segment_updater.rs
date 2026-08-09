@@ -19,6 +19,7 @@ use crate::indexer::index_writer::{advance_deletes, compute_alive_bitset};
 use crate::indexer::merge_operation::MergeOperationInventory;
 use crate::indexer::merger::IndexMerger;
 use crate::indexer::segment_manager::SegmentsStatus;
+use crate::indexer::segment_entry::PublicationGeneration;
 use crate::indexer::stamper::Stamper;
 use crate::indexer::{
     DefaultMergePolicy, MergeCandidate, MergeOperation, MergePolicy, SegmentEntry,
@@ -107,6 +108,7 @@ fn merge(
     }
 
     let delete_cursor = segment_entries[0].delete_cursor().clone();
+    let publication_generation = segment_entries[0].publication_generation();
 
     let segments: Vec<Segment> = segment_entries
         .iter()
@@ -124,7 +126,15 @@ fn merge(
     let merged_segment_id = merged_segment.id();
 
     let segment_meta = index.new_segment_meta(merged_segment_id, num_docs);
-    Ok(Some(SegmentEntry::new(segment_meta, delete_cursor, None)))
+    Ok(Some(match publication_generation {
+        Some(publication_generation) => SegmentEntry::new_for_publication(
+            segment_meta,
+            delete_cursor,
+            None,
+            publication_generation,
+        ),
+        None => SegmentEntry::new(segment_meta, delete_cursor, None),
+    }))
 }
 
 /// Advanced: Merges a list of segments from different indices in a new index.
@@ -354,21 +364,21 @@ impl SegmentUpdater {
         })
     }
 
-    /// Returns readers for the complete segment set as it exists at `target_opstamp` without
-    /// committing it.
+    /// Returns readers for the durable base plus unpublished segments through `generation`.
     ///
-    /// Deletes through the target are held in reader-local overlays; the segment manager, `.del`
-    /// files and durable `meta.json` remain unchanged. Callers must establish their own publication
-    /// barrier before invoking this method: later add operations are not filtered from the snapshot.
-    pub(crate) fn schedule_snapshot_segment_readers(
+    /// This is the generation-aware form of snapshot construction. It rejects an unlabeled
+    /// uncommitted segment instead of guessing whether it belongs before or after the requested
+    /// publication boundary.
+    pub(crate) fn schedule_snapshot_segment_readers_through_generation(
         &self,
         target_opstamp: Opstamp,
+        generation: PublicationGeneration,
     ) -> FutureResult<Vec<SegmentReader>> {
         let segment_updater = self.clone();
         self.schedule_task(move || {
             segment_updater
                 .segment_manager
-                .segment_entries()
+                .segment_entries_through_generation(generation)?
                 .into_iter()
                 .map(|mut segment_entry| {
                     let segment = segment_updater.index.segment(segment_entry.meta().clone());

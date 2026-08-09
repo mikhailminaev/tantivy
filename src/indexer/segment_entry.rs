@@ -5,6 +5,23 @@ use common::BitSet;
 use crate::index::{SegmentId, SegmentMeta};
 use crate::indexer::delete_queue::DeleteCursor;
 
+/// Identifies the publication batch that produced an uncommitted segment.
+///
+/// A generation is local to one `IndexWriter`. It is not persisted in `meta.json`; after a
+/// durable commit its segments become part of the durable base and no longer need this label.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct PublicationGeneration(u64);
+
+impl PublicationGeneration {
+    pub(crate) fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+}
+
 /// A segment entry describes the state of
 /// a given segment, at a given instant.
 ///
@@ -18,6 +35,7 @@ pub struct SegmentEntry {
     meta: SegmentMeta,
     alive_bitset: Option<BitSet>,
     delete_cursor: DeleteCursor,
+    publication_generation: Option<PublicationGeneration>,
 }
 
 impl SegmentEntry {
@@ -31,6 +49,22 @@ impl SegmentEntry {
             meta: segment_meta,
             alive_bitset,
             delete_cursor,
+            publication_generation: None,
+        }
+    }
+
+    /// Creates an uncommitted segment entry owned by one publication generation.
+    pub(crate) fn new_for_publication(
+        segment_meta: SegmentMeta,
+        delete_cursor: DeleteCursor,
+        alive_bitset: Option<BitSet>,
+        publication_generation: PublicationGeneration,
+    ) -> SegmentEntry {
+        SegmentEntry {
+            meta: segment_meta,
+            alive_bitset,
+            delete_cursor,
+            publication_generation: Some(publication_generation),
         }
     }
 
@@ -59,6 +93,14 @@ impl SegmentEntry {
     /// Accessor to the `SegmentMeta`
     pub fn meta(&self) -> &SegmentMeta {
         &self.meta
+    }
+
+    pub(crate) fn publication_generation(&self) -> Option<PublicationGeneration> {
+        self.publication_generation
+    }
+
+    pub(crate) fn clear_publication_generation(&mut self) {
+        self.publication_generation = None;
     }
 }
 
