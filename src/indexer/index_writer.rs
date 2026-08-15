@@ -2,6 +2,7 @@ use std::ops::Range;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use common::BitSet;
 use crossbeam_channel as channel;
@@ -79,7 +80,7 @@ pub struct IndexWriter<D: Document = TantivyDocument> {
 
     options: IndexWriterOptions,
 
-    workers_join_handle: Vec<JoinHandle<crate::Result<()>>>,
+    workers_join_handle: Vec<JoinHandle<crate::Result<WorkerStats>>>,
 
     index_writer_status: IndexWriterStatus<D>,
     operation_sender: AddBatchSender<D>,
@@ -99,7 +100,7 @@ pub struct IndexWriter<D: Document = TantivyDocument> {
 
 enum SealStatus {
     Pending,
-    Complete(Result<(), String>),
+    Complete(Result<GenerationWorkerStats, String>),
 }
 
 struct SealCompletion {
@@ -115,13 +116,13 @@ impl SealCompletion {
         }
     }
 
-    fn complete(&self, result: Result<(), String>) {
+    fn complete(&self, result: Result<GenerationWorkerStats, String>) {
         let mut status = self.status.lock().expect("seal completion lock poisoned");
         *status = SealStatus::Complete(result);
         self.completed.notify_all();
     }
 
-    fn wait(&self) -> crate::Result<()> {
+    fn wait(&self) -> crate::Result<GenerationWorkerStats> {
         let mut status = self.status.lock().expect("seal completion lock poisoned");
         loop {
             match &*status {
@@ -131,7 +132,7 @@ impl SealCompletion {
                         .wait(status)
                         .expect("seal completion lock poisoned");
                 }
-                SealStatus::Complete(Ok(())) => return Ok(()),
+                SealStatus::Complete(Ok(stats)) => return Ok(*stats),
                 SealStatus::Complete(Err(message)) => {
                     return Err(TantivyError::ErrorInThread(message.clone()));
                 }
@@ -142,7 +143,7 @@ impl SealCompletion {
 
 struct SealWork {
     completion: Arc<SealCompletion>,
-    workers: Vec<JoinHandle<crate::Result<()>>>,
+    workers: Vec<JoinHandle<crate::Result<WorkerStats>>>,
 }
 
 struct SealReaper {
@@ -188,14 +189,91 @@ impl SealReaper {
     }
 }
 
-fn wait_for_workers(workers: Vec<JoinHandle<crate::Result<()>>>) -> Result<(), String> {
+fn wait_for_workers(
+    workers: Vec<JoinHandle<crate::Result<WorkerStats>>>,
+) -> Result<GenerationWorkerStats, String> {
+    let mut stats = GenerationWorkerStats::default();
     for worker in workers {
         let worker_result = worker
             .join()
             .map_err(|error| format!("indexing worker panicked: {error:?}"))?;
-        worker_result.map_err(|error| format!("indexing worker failed: {error}"))?;
+        stats.combine(worker_result.map_err(|error| format!("indexing worker failed: {error}"))?);
     }
-    Ok(())
+    Ok(stats)
+}
+
+/// Aggregate time spent materializing one sealed generation's worker segments.
+///
+/// Durations are summed across workers. A single-worker PSG exposes its exact
+/// critical path; multi-worker callers can use the values to identify work but
+/// must not treat their sum as wall-clock latency.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GenerationWorkerStats {
+    document_count: u64,
+    segment_count: u64,
+    segment_writer_create: Duration,
+    document_add: Duration,
+    segment_finalize: Duration,
+    delete_apply: Duration,
+    segment_register: Duration,
+}
+
+impl GenerationWorkerStats {
+    fn combine(&mut self, worker: WorkerStats) {
+        self.document_count += worker.document_count;
+        self.segment_count += worker.segment_count;
+        self.segment_writer_create += worker.segment_writer_create;
+        self.document_add += worker.document_add;
+        self.segment_finalize += worker.segment_finalize;
+        self.delete_apply += worker.delete_apply;
+        self.segment_register += worker.segment_register;
+    }
+
+    /// Number of documents materialized by the sealed generation's workers.
+    pub fn document_count(&self) -> u64 {
+        self.document_count
+    }
+
+    /// Number of finalized segments materialized by the sealed generation's workers.
+    pub fn segment_count(&self) -> u64 {
+        self.segment_count
+    }
+
+    /// Time spent allocating the Tantivy segment writer arena and files.
+    pub fn segment_writer_create_duration(&self) -> Duration {
+        self.segment_writer_create
+    }
+
+    /// Time spent adding documents into Tantivy's in-memory segment writer.
+    pub fn document_add_duration(&self) -> Duration {
+        self.document_add
+    }
+
+    /// Time spent finalizing one or more in-memory segment writers.
+    pub fn segment_finalize_duration(&self) -> Duration {
+        self.segment_finalize
+    }
+
+    /// Time spent applying delete operations to newly materialized segments.
+    pub fn delete_apply_duration(&self) -> Duration {
+        self.delete_apply
+    }
+
+    /// Time spent registering finalized segments with the updater.
+    pub fn segment_register_duration(&self) -> Duration {
+        self.segment_register
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WorkerStats {
+    document_count: u64,
+    segment_count: u64,
+    segment_writer_create: Duration,
+    document_add: Duration,
+    segment_finalize: Duration,
+    delete_apply: Duration,
+    segment_register: Duration,
 }
 
 /// A bounded writer generation that has been cut from the active indexing pipeline.
@@ -216,23 +294,33 @@ pub struct CompletedGeneration {
     segment_updater: SegmentUpdater,
     generation: PublicationGeneration,
     opstamp: Opstamp,
+    worker_stats: GenerationWorkerStats,
 }
 
 impl SealedGeneration {
     /// Waits for all workers in this generation to finish writing their segments.
     pub fn wait(self) -> crate::Result<CompletedGeneration> {
-        self.completion.wait()?;
+        let worker_stats = self.completion.wait()?;
         Ok(CompletedGeneration {
             segment_updater: self.segment_updater,
             generation: self.generation,
             opstamp: self.opstamp,
+            worker_stats,
         })
     }
 }
 
 impl CompletedGeneration {
+    /// Aggregated worker materialization time for this sealed generation.
+    pub fn worker_stats(&self) -> GenerationWorkerStats {
+        self.worker_stats
+    }
+
     /// Opens the complete immutable searcher for this generation without persisting it.
-    pub fn open_searcher(&self, reader: &crate::reader::IndexReader) -> crate::Result<crate::Searcher> {
+    pub fn open_searcher(
+        &self,
+        reader: &crate::reader::IndexReader,
+    ) -> crate::Result<crate::Searcher> {
         let segment_readers = self
             .segment_updater
             .schedule_snapshot_segment_readers_through_generation(self.opstamp, self.generation)
@@ -348,9 +436,17 @@ fn index_documents<D: Document>(
     segment_updater: &SegmentUpdater,
     mut delete_cursor: DeleteCursor,
     publication_generation: PublicationGeneration,
-) -> crate::Result<()> {
+) -> crate::Result<WorkerStats> {
+    let segment_writer_create_started = Instant::now();
     let mut segment_writer = SegmentWriter::for_segment(memory_budget, segment.clone())?;
+    let mut stats = WorkerStats {
+        segment_writer_create: segment_writer_create_started.elapsed(),
+        ..WorkerStats::default()
+    };
+
+    let document_add_started = Instant::now();
     for document_group in grouped_document_iterator {
+        stats.document_count += document_group.len() as u64;
         for doc in document_group {
             segment_writer.add_document(doc)?;
         }
@@ -363,9 +459,10 @@ fn index_documents<D: Document>(
             break;
         }
     }
+    stats.document_add = document_add_started.elapsed();
 
     if !segment_updater.is_alive() {
-        return Ok(());
+        return Ok(stats);
     }
 
     let max_doc = segment_writer.max_doc();
@@ -374,11 +471,15 @@ fn index_documents<D: Document>(
     // the worker thread.
     assert!(max_doc > 0);
 
+    let segment_finalize_started = Instant::now();
     let doc_opstamps: Vec<Opstamp> = segment_writer.finalize()?;
+    stats.segment_finalize = segment_finalize_started.elapsed();
 
     let segment_with_max_doc = segment.with_max_doc(max_doc);
 
+    let delete_apply_started = Instant::now();
     let alive_bitset_opt = apply_deletes(&segment_with_max_doc, &mut delete_cursor, &doc_opstamps)?;
+    stats.delete_apply = delete_apply_started.elapsed();
 
     let meta = segment_with_max_doc.meta().clone();
 
@@ -389,8 +490,11 @@ fn index_documents<D: Document>(
         alive_bitset_opt,
         publication_generation,
     );
+    let segment_register_started = Instant::now();
     segment_updater.schedule_add_segment(segment_entry).wait()?;
-    Ok(())
+    stats.segment_register = segment_register_started.elapsed();
+    stats.segment_count = 1;
+    Ok(stats)
 }
 
 /// `doc_opstamps` is required to be non-empty.
@@ -529,7 +633,7 @@ impl<D: Document> IndexWriter<D> {
 
         let former_workers_handles = std::mem::take(&mut self.workers_join_handle);
         for join_handle in former_workers_handles {
-            join_handle
+            let _stats = join_handle
                 .join()
                 .map_err(|_| error_in_index_worker_thread("Worker thread panicked."))?
                 .map_err(|_| error_in_index_worker_thread("Worker thread failed."))?;
@@ -596,9 +700,10 @@ impl<D: Document> IndexWriter<D> {
         let mem_budget = self.options.memory_budget_per_thread;
         let index = self.index.clone();
         let publication_generation = self.publication_generation;
-        let join_handle: JoinHandle<crate::Result<()>> = thread::Builder::new()
+        let join_handle: JoinHandle<crate::Result<WorkerStats>> = thread::Builder::new()
             .name(format!("thrd-tantivy-index{}", self.worker_id))
             .spawn(move || {
+                let mut stats = WorkerStats::default();
                 loop {
                     let mut document_iterator = document_receiver_clone
                         .clone()
@@ -619,10 +724,10 @@ impl<D: Document> IndexWriter<D> {
                         // It happens when there is a commit, or if the `IndexWriter`
                         // was dropped.
                         index_writer_bomb.defuse();
-                        return Ok(());
+                        return Ok(stats);
                     }
 
-                    index_documents(
+                    let segment_stats = index_documents(
                         mem_budget,
                         index.new_segment(),
                         &mut document_iterator,
@@ -630,6 +735,13 @@ impl<D: Document> IndexWriter<D> {
                         delete_cursor.clone(),
                         publication_generation,
                     )?;
+                    stats.document_count += segment_stats.document_count;
+                    stats.segment_count += segment_stats.segment_count;
+                    stats.segment_writer_create += segment_stats.segment_writer_create;
+                    stats.document_add += segment_stats.document_add;
+                    stats.segment_finalize += segment_stats.segment_finalize;
+                    stats.delete_apply += segment_stats.delete_apply;
+                    stats.segment_register += segment_stats.segment_register;
                 }
             })?;
         self.worker_id += 1;
@@ -825,16 +937,14 @@ impl<D: Document> IndexWriter<D> {
         let former_workers_join_handle = std::mem::take(&mut self.workers_join_handle);
 
         self.publication_generation = prepared_generation.next().ok_or_else(|| {
-            TantivyError::InvalidArgument(
-                "publication generation counter exhausted".to_string(),
-            )
+            TantivyError::InvalidArgument("publication generation counter exhausted".to_string())
         })?;
 
         for worker_handle in former_workers_join_handle {
-            let indexing_worker_result = worker_handle
+            let _stats = worker_handle
                 .join()
                 .map_err(|e| TantivyError::ErrorInThread(format!("{e:?}")))?;
-            indexing_worker_result?;
+            _stats?;
             self.add_indexing_worker()?;
         }
 
@@ -1185,6 +1295,25 @@ mod tests {
         assert_eq!(reader.searcher().search(&first_query, &Count)?, 1);
         assert_eq!(reader.searcher().search(&second_query, &Count)?, 1);
 
+        Ok(())
+    }
+
+    #[test]
+    fn sealed_generation_reports_materialized_documents_and_segments() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let title = schema_builder.add_text_field("title", TEXT | STORED);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer = index.writer_for_tests()?;
+
+        writer.add_document(doc!(title => "first"))?;
+        let completed = writer.seal()?.wait()?;
+
+        let stats = completed.worker_stats();
+        assert_eq!(stats.document_count(), 1);
+        assert_eq!(stats.segment_count(), 1);
+        assert!(stats.document_add_duration() > std::time::Duration::ZERO);
+        assert!(stats.segment_finalize_duration() > std::time::Duration::ZERO);
+        assert!(stats.segment_register_duration() > std::time::Duration::ZERO);
         Ok(())
     }
 
