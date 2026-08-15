@@ -30,6 +30,11 @@ const INITIAL_TERM_TABLE_CAPACITY_MAX: usize = 1 << 14;
 pub(crate) struct SegmentWriterCreationStats {
     term_table_create: Duration,
     segment_serializer_create: Duration,
+    store_open: Duration,
+    store_writer_create: Duration,
+    fast_fields_open: Duration,
+    fieldnorms_output_open: Duration,
+    postings_open: Duration,
     field_writers_create: Duration,
 }
 
@@ -40,6 +45,26 @@ impl SegmentWriterCreationStats {
 
     pub(crate) fn segment_serializer_create_duration(&self) -> Duration {
         self.segment_serializer_create
+    }
+
+    pub(crate) fn store_open_duration(&self) -> Duration {
+        self.store_open
+    }
+
+    pub(crate) fn store_writer_create_duration(&self) -> Duration {
+        self.store_writer_create
+    }
+
+    pub(crate) fn fast_fields_open_duration(&self) -> Duration {
+        self.fast_fields_open
+    }
+
+    pub(crate) fn fieldnorms_output_open_duration(&self) -> Duration {
+        self.fieldnorms_output_open
+    }
+
+    pub(crate) fn postings_open_duration(&self) -> Duration {
+        self.postings_open
     }
 
     pub(crate) fn field_writers_create_duration(&self) -> Duration {
@@ -55,6 +80,10 @@ pub(crate) struct SegmentWriterFinalizeStats {
     postings_serialize: Duration,
     fast_fields_serialize: Duration,
     serializer_close: Duration,
+    fieldnorms_close: Duration,
+    fast_fields_close: Duration,
+    postings_close: Duration,
+    store_writer_close: Duration,
 }
 
 impl SegmentWriterFinalizeStats {
@@ -80,6 +109,22 @@ impl SegmentWriterFinalizeStats {
 
     pub(crate) fn serializer_close_duration(&self) -> Duration {
         self.serializer_close
+    }
+
+    pub(crate) fn fieldnorms_close_duration(&self) -> Duration {
+        self.fieldnorms_close
+    }
+
+    pub(crate) fn fast_fields_close_duration(&self) -> Duration {
+        self.fast_fields_close
+    }
+
+    pub(crate) fn postings_close_duration(&self) -> Duration {
+        self.postings_close
+    }
+
+    pub(crate) fn store_writer_close_duration(&self) -> Duration {
+        self.store_writer_close
     }
 }
 
@@ -147,6 +192,7 @@ impl SegmentWriter {
         let segment_serializer_create_started = Instant::now();
         let segment_serializer = SegmentSerializer::for_segment(segment)?;
         let segment_serializer_create = segment_serializer_create_started.elapsed();
+        let segment_serializer_stats = segment_serializer.creation_stats();
 
         let field_writers_create_started = Instant::now();
         let per_field_postings_writers = PerFieldPostingsWriter::for_schema(&schema);
@@ -193,6 +239,11 @@ impl SegmentWriter {
             creation_stats: SegmentWriterCreationStats {
                 term_table_create,
                 segment_serializer_create,
+                store_open: segment_serializer_stats.store_open_duration(),
+                store_writer_create: segment_serializer_stats.store_writer_create_duration(),
+                fast_fields_open: segment_serializer_stats.fast_fields_open_duration(),
+                fieldnorms_output_open: segment_serializer_stats.fieldnorms_output_open_duration(),
+                postings_open: segment_serializer_stats.postings_open_duration(),
                 field_writers_create,
             },
         })
@@ -516,8 +567,12 @@ fn remap_and_write(
 
     debug!("serializer-close");
     let serializer_close_started = Instant::now();
-    serializer.close()?;
+    let serializer_close_stats = serializer.close_with_stats()?;
     stats.serializer_close = serializer_close_started.elapsed();
+    stats.fieldnorms_close = serializer_close_stats.fieldnorms_close_duration();
+    stats.fast_fields_close = serializer_close_stats.fast_fields_close_duration();
+    stats.postings_close = serializer_close_stats.postings_close_duration();
+    stats.store_writer_close = serializer_close_stats.store_writer_close_duration();
 
     Ok(stats)
 }
