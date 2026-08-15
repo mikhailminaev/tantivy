@@ -212,8 +212,17 @@ pub struct GenerationWorkerStats {
     document_count: u64,
     segment_count: u64,
     segment_writer_create: Duration,
+    term_table_create: Duration,
+    segment_serializer_create: Duration,
+    field_writers_create: Duration,
     document_add: Duration,
     segment_finalize: Duration,
+    fieldnorms_prepare: Duration,
+    fieldnorms_serialize: Duration,
+    fieldnorms_open: Duration,
+    postings_serialize: Duration,
+    fast_fields_serialize: Duration,
+    serializer_close: Duration,
     delete_apply: Duration,
     segment_register: Duration,
 }
@@ -223,8 +232,17 @@ impl GenerationWorkerStats {
         self.document_count += worker.document_count;
         self.segment_count += worker.segment_count;
         self.segment_writer_create += worker.segment_writer_create;
+        self.term_table_create += worker.term_table_create;
+        self.segment_serializer_create += worker.segment_serializer_create;
+        self.field_writers_create += worker.field_writers_create;
         self.document_add += worker.document_add;
         self.segment_finalize += worker.segment_finalize;
+        self.fieldnorms_prepare += worker.fieldnorms_prepare;
+        self.fieldnorms_serialize += worker.fieldnorms_serialize;
+        self.fieldnorms_open += worker.fieldnorms_open;
+        self.postings_serialize += worker.postings_serialize;
+        self.fast_fields_serialize += worker.fast_fields_serialize;
+        self.serializer_close += worker.serializer_close;
         self.delete_apply += worker.delete_apply;
         self.segment_register += worker.segment_register;
     }
@@ -244,6 +262,21 @@ impl GenerationWorkerStats {
         self.segment_writer_create
     }
 
+    /// Time spent allocating the term table for one or more segment writers.
+    pub fn term_table_create_duration(&self) -> Duration {
+        self.term_table_create
+    }
+
+    /// Time spent opening segment output serializers and component files.
+    pub fn segment_serializer_create_duration(&self) -> Duration {
+        self.segment_serializer_create
+    }
+
+    /// Time spent creating field-specific index writers and analyzers.
+    pub fn field_writers_create_duration(&self) -> Duration {
+        self.field_writers_create
+    }
+
     /// Time spent adding documents into Tantivy's in-memory segment writer.
     pub fn document_add_duration(&self) -> Duration {
         self.document_add
@@ -252,6 +285,36 @@ impl GenerationWorkerStats {
     /// Time spent finalizing one or more in-memory segment writers.
     pub fn segment_finalize_duration(&self) -> Duration {
         self.segment_finalize
+    }
+
+    /// Time spent preparing field norms before segment serialization.
+    pub fn fieldnorms_prepare_duration(&self) -> Duration {
+        self.fieldnorms_prepare
+    }
+
+    /// Time spent serializing field norms for finalized segments.
+    pub fn fieldnorms_serialize_duration(&self) -> Duration {
+        self.fieldnorms_serialize
+    }
+
+    /// Time spent reopening serialized field norms for postings serialization.
+    pub fn fieldnorms_open_duration(&self) -> Duration {
+        self.fieldnorms_open
+    }
+
+    /// Time spent serializing postings for finalized segments.
+    pub fn postings_serialize_duration(&self) -> Duration {
+        self.postings_serialize
+    }
+
+    /// Time spent serializing fast fields for finalized segments.
+    pub fn fast_fields_serialize_duration(&self) -> Duration {
+        self.fast_fields_serialize
+    }
+
+    /// Time spent closing segment serializers and their output streams.
+    pub fn serializer_close_duration(&self) -> Duration {
+        self.serializer_close
     }
 
     /// Time spent applying delete operations to newly materialized segments.
@@ -270,8 +333,17 @@ struct WorkerStats {
     document_count: u64,
     segment_count: u64,
     segment_writer_create: Duration,
+    term_table_create: Duration,
+    segment_serializer_create: Duration,
+    field_writers_create: Duration,
     document_add: Duration,
     segment_finalize: Duration,
+    fieldnorms_prepare: Duration,
+    fieldnorms_serialize: Duration,
+    fieldnorms_open: Duration,
+    postings_serialize: Duration,
+    fast_fields_serialize: Duration,
+    serializer_close: Duration,
     delete_apply: Duration,
     segment_register: Duration,
 }
@@ -443,6 +515,10 @@ fn index_documents<D: Document>(
         segment_writer_create: segment_writer_create_started.elapsed(),
         ..WorkerStats::default()
     };
+    let creation_stats = segment_writer.creation_stats();
+    stats.term_table_create = creation_stats.term_table_create_duration();
+    stats.segment_serializer_create = creation_stats.segment_serializer_create_duration();
+    stats.field_writers_create = creation_stats.field_writers_create_duration();
 
     let document_add_started = Instant::now();
     for document_group in grouped_document_iterator {
@@ -472,8 +548,14 @@ fn index_documents<D: Document>(
     assert!(max_doc > 0);
 
     let segment_finalize_started = Instant::now();
-    let doc_opstamps: Vec<Opstamp> = segment_writer.finalize()?;
+    let (doc_opstamps, finalize_stats) = segment_writer.finalize_with_stats()?;
     stats.segment_finalize = segment_finalize_started.elapsed();
+    stats.fieldnorms_prepare = finalize_stats.fieldnorms_prepare_duration();
+    stats.fieldnorms_serialize = finalize_stats.fieldnorms_serialize_duration();
+    stats.fieldnorms_open = finalize_stats.fieldnorms_open_duration();
+    stats.postings_serialize = finalize_stats.postings_serialize_duration();
+    stats.fast_fields_serialize = finalize_stats.fast_fields_serialize_duration();
+    stats.serializer_close = finalize_stats.serializer_close_duration();
 
     let segment_with_max_doc = segment.with_max_doc(max_doc);
 
@@ -738,8 +820,17 @@ impl<D: Document> IndexWriter<D> {
                     stats.document_count += segment_stats.document_count;
                     stats.segment_count += segment_stats.segment_count;
                     stats.segment_writer_create += segment_stats.segment_writer_create;
+                    stats.term_table_create += segment_stats.term_table_create;
+                    stats.segment_serializer_create += segment_stats.segment_serializer_create;
+                    stats.field_writers_create += segment_stats.field_writers_create;
                     stats.document_add += segment_stats.document_add;
                     stats.segment_finalize += segment_stats.segment_finalize;
+                    stats.fieldnorms_prepare += segment_stats.fieldnorms_prepare;
+                    stats.fieldnorms_serialize += segment_stats.fieldnorms_serialize;
+                    stats.fieldnorms_open += segment_stats.fieldnorms_open;
+                    stats.postings_serialize += segment_stats.postings_serialize;
+                    stats.fast_fields_serialize += segment_stats.fast_fields_serialize;
+                    stats.serializer_close += segment_stats.serializer_close;
                     stats.delete_apply += segment_stats.delete_apply;
                     stats.segment_register += segment_stats.segment_register;
                 }
@@ -1311,8 +1402,12 @@ mod tests {
         let stats = completed.worker_stats();
         assert_eq!(stats.document_count(), 1);
         assert_eq!(stats.segment_count(), 1);
+        assert!(stats.segment_serializer_create_duration() > std::time::Duration::ZERO);
+        assert!(stats.field_writers_create_duration() > std::time::Duration::ZERO);
         assert!(stats.document_add_duration() > std::time::Duration::ZERO);
         assert!(stats.segment_finalize_duration() > std::time::Duration::ZERO);
+        assert!(stats.postings_serialize_duration() > std::time::Duration::ZERO);
+        assert!(stats.serializer_close_duration() > std::time::Duration::ZERO);
         assert!(stats.segment_register_duration() > std::time::Duration::ZERO);
         Ok(())
     }

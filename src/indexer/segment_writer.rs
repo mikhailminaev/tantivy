@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use columnar::MonotonicallyMappableToU64;
 use common::JsonPathWriter;
 use itertools::Itertools;
@@ -23,6 +25,63 @@ use crate::{DocId, Opstamp, TantivyError};
 // Keeping the initial term table bounded avoids clearing and later scanning a large sparse
 // allocation for small NRT segments; `SharedArenaHashMap` grows it as needed for large batches.
 const INITIAL_TERM_TABLE_CAPACITY_MAX: usize = 1 << 14;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SegmentWriterCreationStats {
+    term_table_create: Duration,
+    segment_serializer_create: Duration,
+    field_writers_create: Duration,
+}
+
+impl SegmentWriterCreationStats {
+    pub(crate) fn term_table_create_duration(&self) -> Duration {
+        self.term_table_create
+    }
+
+    pub(crate) fn segment_serializer_create_duration(&self) -> Duration {
+        self.segment_serializer_create
+    }
+
+    pub(crate) fn field_writers_create_duration(&self) -> Duration {
+        self.field_writers_create
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SegmentWriterFinalizeStats {
+    fieldnorms_prepare: Duration,
+    fieldnorms_serialize: Duration,
+    fieldnorms_open: Duration,
+    postings_serialize: Duration,
+    fast_fields_serialize: Duration,
+    serializer_close: Duration,
+}
+
+impl SegmentWriterFinalizeStats {
+    pub(crate) fn fieldnorms_prepare_duration(&self) -> Duration {
+        self.fieldnorms_prepare
+    }
+
+    pub(crate) fn fieldnorms_serialize_duration(&self) -> Duration {
+        self.fieldnorms_serialize
+    }
+
+    pub(crate) fn fieldnorms_open_duration(&self) -> Duration {
+        self.fieldnorms_open
+    }
+
+    pub(crate) fn postings_serialize_duration(&self) -> Duration {
+        self.postings_serialize
+    }
+
+    pub(crate) fn fast_fields_serialize_duration(&self) -> Duration {
+        self.fast_fields_serialize
+    }
+
+    pub(crate) fn serializer_close_duration(&self) -> Duration {
+        self.serializer_close
+    }
+}
 
 /// Computes the initial size of the hash table.
 ///
@@ -62,6 +121,7 @@ pub struct SegmentWriter {
     per_field_text_analyzers: Vec<TextAnalyzer>,
     term_buffer: IndexingTerm,
     schema: Schema,
+    creation_stats: SegmentWriterCreationStats,
 }
 
 impl SegmentWriter {
@@ -79,7 +139,16 @@ impl SegmentWriter {
         let tokenizer_manager = segment.index().tokenizers().clone();
         let tokenizer_manager_fast_field = segment.index().fast_field_tokenizer().clone();
         let table_size = compute_initial_table_size(memory_budget_in_bytes)?;
+
+        let term_table_create_started = Instant::now();
+        let ctx = IndexingContext::new(table_size);
+        let term_table_create = term_table_create_started.elapsed();
+
+        let segment_serializer_create_started = Instant::now();
         let segment_serializer = SegmentSerializer::for_segment(segment)?;
+        let segment_serializer_create = segment_serializer_create_started.elapsed();
+
+        let field_writers_create_started = Instant::now();
         let per_field_postings_writers = PerFieldPostingsWriter::for_schema(&schema);
         let per_field_text_analyzers = schema
             .fields()
@@ -103,32 +172,51 @@ impl SegmentWriter {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let fieldnorms_writer = FieldNormsWriter::for_schema(&schema);
+        let fast_field_writers =
+            FastFieldsWriter::from_schema_and_tokenizer_manager(&schema, tokenizer_manager_fast_field)?;
+        let field_writers_create = field_writers_create_started.elapsed();
+
         Ok(Self {
             max_doc: 0,
-            ctx: IndexingContext::new(table_size),
+            ctx,
             per_field_postings_writers,
-            fieldnorms_writer: FieldNormsWriter::for_schema(&schema),
+            fieldnorms_writer,
             json_path_writer: JsonPathWriter::default(),
             json_positions_per_path: IndexingPositionsPerPath::default(),
             segment_serializer,
-            fast_field_writers: FastFieldsWriter::from_schema_and_tokenizer_manager(
-                &schema,
-                tokenizer_manager_fast_field,
-            )?,
+            fast_field_writers,
             doc_opstamps: Vec::with_capacity(1_000),
             per_field_text_analyzers,
             term_buffer: IndexingTerm::with_capacity(16),
             schema,
+            creation_stats: SegmentWriterCreationStats {
+                term_table_create,
+                segment_serializer_create,
+                field_writers_create,
+            },
         })
+    }
+
+    pub(crate) fn creation_stats(&self) -> SegmentWriterCreationStats {
+        self.creation_stats
     }
 
     /// Lay on disk the current content of the `SegmentWriter`
     ///
     /// Finalize consumes the `SegmentWriter`, so that it cannot
     /// be used afterwards.
-    pub fn finalize(mut self) -> crate::Result<Vec<u64>> {
+    pub fn finalize(self) -> crate::Result<Vec<u64>> {
+        self.finalize_with_stats().map(|(doc_opstamps, _)| doc_opstamps)
+    }
+
+    pub(crate) fn finalize_with_stats(
+        mut self,
+    ) -> crate::Result<(Vec<u64>, SegmentWriterFinalizeStats)> {
+        let fieldnorms_prepare_started = Instant::now();
         self.fieldnorms_writer.fill_up_to_max_doc(self.max_doc);
-        remap_and_write(
+        let fieldnorms_prepare = fieldnorms_prepare_started.elapsed();
+        let mut stats = remap_and_write(
             self.schema,
             &self.per_field_postings_writers,
             self.ctx,
@@ -136,7 +224,8 @@ impl SegmentWriter {
             &self.fieldnorms_writer,
             self.segment_serializer,
         )?;
-        Ok(self.doc_opstamps)
+        stats.fieldnorms_prepare = fieldnorms_prepare;
+        Ok((self.doc_opstamps, stats))
     }
 
     /// Returns an estimation of the current memory usage of the segment writer.
@@ -397,15 +486,21 @@ fn remap_and_write(
     fast_field_writers: FastFieldsWriter,
     fieldnorms_writer: &FieldNormsWriter,
     mut serializer: SegmentSerializer,
-) -> crate::Result<()> {
+) -> crate::Result<SegmentWriterFinalizeStats> {
+    let mut stats = SegmentWriterFinalizeStats::default();
     debug!("remap-and-write");
     if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
+        let fieldnorms_serialize_started = Instant::now();
         fieldnorms_writer.serialize(fieldnorms_serializer)?;
+        stats.fieldnorms_serialize = fieldnorms_serialize_started.elapsed();
     }
+    let fieldnorms_open_started = Instant::now();
     let fieldnorm_data = serializer
         .segment()
         .open_read(SegmentComponent::FieldNorms)?;
     let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
+    stats.fieldnorms_open = fieldnorms_open_started.elapsed();
+    let postings_serialize_started = Instant::now();
     serialize_postings(
         ctx,
         schema,
@@ -413,13 +508,18 @@ fn remap_and_write(
         fieldnorm_readers,
         serializer.get_postings_serializer(),
     )?;
+    stats.postings_serialize = postings_serialize_started.elapsed();
     debug!("fastfield-serialize");
+    let fast_fields_serialize_started = Instant::now();
     fast_field_writers.serialize(serializer.get_fast_field_write())?;
+    stats.fast_fields_serialize = fast_fields_serialize_started.elapsed();
 
     debug!("serializer-close");
+    let serializer_close_started = Instant::now();
     serializer.close()?;
+    stats.serializer_close = serializer_close_started.elapsed();
 
-    Ok(())
+    Ok(stats)
 }
 
 #[cfg(test)]
