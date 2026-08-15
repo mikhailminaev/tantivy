@@ -19,6 +19,11 @@ use crate::schema::{FieldEntry, FieldType, Schema, DATE_TIME_PRECISION_INDEXED};
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
 use crate::{DocId, Opstamp, TantivyError};
 
+// A generation can be sealed long before it approaches its configured memory budget.
+// Keeping the initial term table bounded avoids clearing and later scanning a large sparse
+// allocation for small NRT segments; `SharedArenaHashMap` grows it as needed for large batches.
+const INITIAL_TERM_TABLE_CAPACITY_MAX: usize = 1 << 14;
+
 /// Computes the initial size of the hash table.
 ///
 /// Returns the recommended initial table size as a power of 2.
@@ -26,12 +31,11 @@ use crate::{DocId, Opstamp, TantivyError};
 /// Note this is a very dumb way to compute log2, but it is easier to proofread that way.
 fn compute_initial_table_size(per_thread_memory_budget: usize) -> crate::Result<usize> {
     let table_memory_upper_bound = per_thread_memory_budget / 3;
-    (10..20) // We cap it at 2^19 = 512K capacity.
-        // TODO: There are cases where this limit causes a
-        // reallocation in the hashmap. Check if this affects performance.
+    (10..20)
         .map(|power| 1 << power)
         .take_while(|capacity| compute_table_memory_size(*capacity) < table_memory_upper_bound)
         .last()
+        .map(|capacity| capacity.min(INITIAL_TERM_TABLE_CAPACITY_MAX))
         .ok_or_else(|| {
             crate::TantivyError::InvalidArgument(format!(
                 "per thread memory budget (={per_thread_memory_budget}) is too small. Raise the \
@@ -448,10 +452,10 @@ mod tests {
     fn test_hashmap_size() {
         use super::compute_initial_table_size;
         assert_eq!(compute_initial_table_size(100_000).unwrap(), 1 << 12);
-        assert_eq!(compute_initial_table_size(1_000_000).unwrap(), 1 << 15);
-        assert_eq!(compute_initial_table_size(15_000_000).unwrap(), 1 << 19);
-        assert_eq!(compute_initial_table_size(1_000_000_000).unwrap(), 1 << 19);
-        assert_eq!(compute_initial_table_size(4_000_000_000).unwrap(), 1 << 19);
+        assert_eq!(compute_initial_table_size(1_000_000).unwrap(), 1 << 14);
+        assert_eq!(compute_initial_table_size(15_000_000).unwrap(), 1 << 14);
+        assert_eq!(compute_initial_table_size(1_000_000_000).unwrap(), 1 << 14);
+        assert_eq!(compute_initial_table_size(4_000_000_000).unwrap(), 1 << 14);
     }
 
     #[test]
