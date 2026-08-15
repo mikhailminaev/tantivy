@@ -323,6 +323,10 @@ impl Directory for ManagedDirectory {
         self.directory.sync_directory()?;
         Ok(())
     }
+
+    fn sync_pending_writes(&self) -> io::Result<()> {
+        self.directory.sync_pending_writes()
+    }
 }
 
 impl Clone for ManagedDirectory {

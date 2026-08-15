@@ -11,7 +11,7 @@ use super::{FieldMetadata, IndexSettings};
 use crate::core::{Executor, META_FILEPATH};
 use crate::directory::error::OpenReadError;
 #[cfg(feature = "mmap")]
-use crate::directory::MmapDirectory;
+use crate::directory::{MmapDirectory, MmapWriteDurability};
 use crate::directory::{Directory, ManagedDirectory, RamDirectory, INDEX_WRITER_LOCK};
 use crate::error::{DataCorruption, TantivyError};
 use crate::index::{IndexMeta, SegmentId, SegmentMeta, SegmentMetaInventory};
@@ -167,6 +167,23 @@ impl IndexBuilder {
     #[cfg(feature = "mmap")]
     pub fn create_in_dir<P: AsRef<Path>>(self, directory_path: P) -> crate::Result<Index> {
         let mmap_directory: Box<dyn Directory> = Box::new(MmapDirectory::open(directory_path)?);
+        if Index::exists(&*mmap_directory)? {
+            return Err(TantivyError::IndexAlreadyExists);
+        }
+        self.create(mmap_directory)
+    }
+
+    /// Creates an index backed by an mmap directory with an explicit component
+    /// write-durability policy.
+    #[cfg(feature = "mmap")]
+    pub fn create_in_dir_with_mmap_write_durability<P: AsRef<Path>>(
+        self,
+        directory_path: P,
+        write_durability: MmapWriteDurability,
+    ) -> crate::Result<Index> {
+        let mmap_directory: Box<dyn Directory> = Box::new(
+            MmapDirectory::open_with_write_durability(directory_path, write_durability)?,
+        );
         if Index::exists(&*mmap_directory)? {
             return Err(TantivyError::IndexAlreadyExists);
         }
@@ -339,6 +356,19 @@ impl Index {
             .create_in_dir(directory_path)
     }
 
+    /// Creates an mmap-backed index with an explicit component write-durability
+    /// policy.
+    #[cfg(feature = "mmap")]
+    pub fn create_in_dir_with_mmap_write_durability<P: AsRef<Path>>(
+        directory_path: P,
+        schema: Schema,
+        write_durability: MmapWriteDurability,
+    ) -> crate::Result<Index> {
+        IndexBuilder::new()
+            .schema(schema)
+            .create_in_dir_with_mmap_write_durability(directory_path, write_durability)
+    }
+
     /// Opens or creates a new index in the provided directory
     pub fn open_or_create<T: Into<Box<dyn Directory>>>(
         dir: T,
@@ -463,6 +493,18 @@ impl Index {
     #[cfg(feature = "mmap")]
     pub fn open_in_dir<P: AsRef<Path>>(directory_path: P) -> crate::Result<Index> {
         let mmap_directory = MmapDirectory::open(directory_path)?;
+        Index::open(mmap_directory)
+    }
+
+    /// Opens an mmap-backed index with an explicit component write-durability
+    /// policy for future writes.
+    #[cfg(feature = "mmap")]
+    pub fn open_in_dir_with_mmap_write_durability<P: AsRef<Path>>(
+        directory_path: P,
+        write_durability: MmapWriteDurability,
+    ) -> crate::Result<Index> {
+        let mmap_directory =
+            MmapDirectory::open_with_write_durability(directory_path, write_durability)?;
         Index::open(mmap_directory)
     }
 

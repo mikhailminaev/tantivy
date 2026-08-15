@@ -1,12 +1,12 @@
 mod file_watcher;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use common::StableDeref;
 use file_watcher::FileWatcher;
@@ -167,17 +167,42 @@ pub struct MmapDirectory {
     inner: Arc<MmapDirectoryInner>,
 }
 
+/// Durability policy for regular component files written through
+/// [`MmapDirectory::open_write`].
+///
+/// `Deferred` is intended only for an index that has an independent durable
+/// recovery source. Completed files remain immediately readable, but their
+/// `sync_data` cost moves to [`Directory::sync_pending_writes`]. Tantivy calls
+/// that hook before publishing a durable `meta.json`, so a durable commit never
+/// references an unsynchronized component file.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MmapWriteDurability {
+    /// Synchronize each component when its writer terminates.
+    #[default]
+    Immediate,
+    /// Synchronize completed components together at the durable metadata barrier.
+    Deferred,
+}
+
 struct MmapDirectoryInner {
     root_path: PathBuf,
     mmap_cache: RwLock<MmapCache>,
+    write_durability: MmapWriteDurability,
+    pending_sync_paths: Arc<Mutex<HashSet<PathBuf>>>,
     _temp_directory: Option<TempDir>,
     watcher: FileWatcher,
 }
 
 impl MmapDirectoryInner {
-    fn new(root_path: PathBuf, temp_directory: Option<TempDir>) -> MmapDirectoryInner {
+    fn new(
+        root_path: PathBuf,
+        temp_directory: Option<TempDir>,
+        write_durability: MmapWriteDurability,
+    ) -> MmapDirectoryInner {
         MmapDirectoryInner {
             mmap_cache: RwLock::new(MmapCache::new()),
+            write_durability,
+            pending_sync_paths: Arc::new(Mutex::new(HashSet::new())),
             _temp_directory: temp_directory,
             watcher: FileWatcher::new(&root_path.join(*META_FILEPATH)),
             root_path,
@@ -196,8 +221,12 @@ impl fmt::Debug for MmapDirectory {
 }
 
 impl MmapDirectory {
-    fn new(root_path: PathBuf, temp_directory: Option<TempDir>) -> MmapDirectory {
-        let inner = MmapDirectoryInner::new(root_path, temp_directory);
+    fn new(
+        root_path: PathBuf,
+        temp_directory: Option<TempDir>,
+        write_durability: MmapWriteDurability,
+    ) -> MmapDirectory {
+        let inner = MmapDirectoryInner::new(root_path, temp_directory, write_durability);
         MmapDirectory {
             inner: Arc::new(inner),
         }
@@ -213,6 +242,7 @@ impl MmapDirectory {
         Ok(MmapDirectory::new(
             tempdir.path().to_path_buf(),
             Some(tempdir),
+            MmapWriteDurability::Immediate,
         ))
     }
 
@@ -224,7 +254,10 @@ impl MmapDirectory {
         directory_path: impl AsRef<Path>,
         madvice: Advice,
     ) -> Result<MmapDirectory, OpenDirectoryError> {
-        let dir = Self::open_impl_to_avoid_monomorphization(directory_path.as_ref())?;
+        let dir = Self::open_impl_to_avoid_monomorphization(
+            directory_path.as_ref(),
+            MmapWriteDurability::Immediate,
+        )?;
         dir.inner.mmap_cache.write().unwrap().set_advice(madvice);
         Ok(dir)
     }
@@ -234,12 +267,25 @@ impl MmapDirectory {
     /// Returns an error if the `directory_path` does not
     /// exist or if it is not a directory.
     pub fn open(directory_path: impl AsRef<Path>) -> Result<MmapDirectory, OpenDirectoryError> {
-        Self::open_impl_to_avoid_monomorphization(directory_path.as_ref())
+        Self::open_with_write_durability(directory_path, MmapWriteDurability::Immediate)
+    }
+
+    /// Opens a directory with an explicit component-file durability policy.
+    ///
+    /// Callers selecting [`MmapWriteDurability::Deferred`] must retain a
+    /// recoverable source for unpublished writes. Tantivy's durable commit path
+    /// invokes [`Directory::sync_pending_writes`] before publishing metadata.
+    pub fn open_with_write_durability(
+        directory_path: impl AsRef<Path>,
+        write_durability: MmapWriteDurability,
+    ) -> Result<MmapDirectory, OpenDirectoryError> {
+        Self::open_impl_to_avoid_monomorphization(directory_path.as_ref(), write_durability)
     }
 
     #[inline(never)]
     fn open_impl_to_avoid_monomorphization(
         directory_path: &Path,
+        write_durability: MmapWriteDurability,
     ) -> Result<MmapDirectory, OpenDirectoryError> {
         if !directory_path.exists() {
             return Err(OpenDirectoryError::DoesNotExist(PathBuf::from(
@@ -267,7 +313,7 @@ impl MmapDirectory {
                 directory_path,
             )));
         }
-        Ok(MmapDirectory::new(canonical_path, None))
+        Ok(MmapDirectory::new(canonical_path, None, write_durability))
     }
 
     /// Joins a relative_path to the directory `root_path`
@@ -293,6 +339,15 @@ impl MmapDirectory {
             .expect("Mmap cache lock is poisoned.")
             .get_info()
     }
+
+    #[cfg(test)]
+    fn pending_sync_file_count(&self) -> usize {
+        self.inner
+            .pending_sync_paths
+            .lock()
+            .expect("pending sync paths lock poisoned")
+            .len()
+    }
 }
 
 /// We rely on fs2 for file locking. On Windows & MacOS this
@@ -310,19 +365,31 @@ impl Drop for ReleaseLockFile {
     }
 }
 
-/// This Write wraps a File, but has the specificity of
-/// call `sync_all` on flush.
-struct SafeFileWriter(File);
+/// This write wrapper either synchronizes its file at termination or records
+/// it for the directory's later durable metadata barrier.
+struct SafeFileWriter {
+    file: File,
+    pending_sync_paths: Option<Arc<Mutex<HashSet<PathBuf>>>>,
+    path: PathBuf,
+}
 
 impl SafeFileWriter {
-    fn new(file: File) -> SafeFileWriter {
-        SafeFileWriter(file)
+    fn new(
+        file: File,
+        pending_sync_paths: Option<Arc<Mutex<HashSet<PathBuf>>>>,
+        path: PathBuf,
+    ) -> SafeFileWriter {
+        SafeFileWriter {
+            file,
+            pending_sync_paths,
+            path,
+        }
     }
 }
 
 impl Write for SafeFileWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
+        self.file.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -332,8 +399,15 @@ impl Write for SafeFileWriter {
 
 impl TerminatingWrite for SafeFileWriter {
     fn terminate_ref(&mut self, _: AntiCallToken) -> io::Result<()> {
-        self.0.flush()?;
-        self.0.sync_data()?;
+        self.file.flush()?;
+        if let Some(pending_sync_paths) = &self.pending_sync_paths {
+            pending_sync_paths
+                .lock()
+                .expect("pending sync paths lock poisoned")
+                .insert(self.path.clone());
+        } else {
+            self.file.sync_data()?;
+        }
         Ok(())
     }
 }
@@ -422,7 +496,7 @@ impl Directory for MmapDirectory {
         let open_res = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(full_path);
+            .open(&full_path);
 
         let mut file = open_res.map_err(|io_err| {
             if io_err.kind() == io::ErrorKind::AlreadyExists {
@@ -444,7 +518,9 @@ impl Directory for MmapDirectory {
         // The file will only be durably written after we terminate AND
         // sync_directory() is called.
 
-        let writer = SafeFileWriter::new(file);
+        let pending_sync_paths = (self.inner.write_durability == MmapWriteDurability::Deferred)
+            .then(|| Arc::clone(&self.inner.pending_sync_paths));
+        let writer = SafeFileWriter::new(file, pending_sync_paths, full_path);
         Ok(BufWriter::new(Box::new(writer)))
     }
 
@@ -521,6 +597,30 @@ impl Directory for MmapDirectory {
         fd.sync_data()?;
         Ok(())
     }
+
+    fn sync_pending_writes(&self) -> io::Result<()> {
+        let mut pending_paths: Vec<_> = self
+            .inner
+            .pending_sync_paths
+            .lock()
+            .expect("pending sync paths lock poisoned")
+            .drain()
+            .collect();
+        pending_paths.sort();
+
+        for pending_index in 0..pending_paths.len() {
+            let sync_result = File::open(&pending_paths[pending_index]).and_then(|file| file.sync_data());
+            if let Err(error) = sync_result {
+                self.inner
+                    .pending_sync_paths
+                    .lock()
+                    .expect("pending sync paths lock poisoned")
+                    .extend(pending_paths.drain(pending_index..));
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -557,6 +657,90 @@ mod tests {
         }
         let readonlymap = mmap_directory.open_read(&path).unwrap();
         assert_eq!(readonlymap.len(), 0);
+    }
+
+    #[test]
+    fn deferred_component_sync_waits_for_the_durable_barrier() {
+        let tempdir = TempDir::new().unwrap();
+        let directory = MmapDirectory::open_with_write_durability(
+            tempdir.path(),
+            MmapWriteDurability::Deferred,
+        )
+        .unwrap();
+        let path = Path::new("component");
+        let mut writer = directory.open_write(path).unwrap();
+        writer.write_all(b"visible before durable commit").unwrap();
+        writer.terminate().unwrap();
+
+        assert_eq!(directory.pending_sync_file_count(), 1);
+        assert_eq!(directory.open_read(path).unwrap().read_bytes().unwrap().as_slice(), b"visible before durable commit");
+
+        directory.sync_pending_writes().unwrap();
+        assert_eq!(directory.pending_sync_file_count(), 0);
+    }
+
+    #[test]
+    fn deferred_component_sync_completes_before_commit_metadata() {
+        let tempdir = TempDir::new().unwrap();
+        let directory = MmapDirectory::open_with_write_durability(
+            tempdir.path(),
+            MmapWriteDurability::Deferred,
+        )
+        .unwrap();
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create(directory.clone(), schema_builder.build(), IndexSettings::default())
+            .unwrap();
+        let mut writer: IndexWriter = index.writer_for_tests().unwrap();
+        writer.add_document(doc!(text => "durable after barrier")).unwrap();
+
+        let prepared = writer.prepare_commit().unwrap();
+        assert!(directory.pending_sync_file_count() > 0);
+        prepared.commit().unwrap();
+        assert_eq!(directory.pending_sync_file_count(), 0);
+
+        drop(writer);
+        drop(index);
+        let reopened = Index::open(MmapDirectory::open(tempdir.path()).unwrap()).unwrap();
+        let reader = reopened.reader().unwrap();
+        assert_eq!(reader.searcher().num_docs(), 1);
+    }
+
+    #[test]
+    fn deferred_component_sync_failure_does_not_publish_commit_metadata() {
+        let tempdir = TempDir::new().unwrap();
+        let directory = MmapDirectory::open_with_write_durability(
+            tempdir.path(),
+            MmapWriteDurability::Deferred,
+        )
+        .unwrap();
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create(directory.clone(), schema_builder.build(), IndexSettings::default())
+            .unwrap();
+        let mut writer: IndexWriter = index.writer_for_tests().unwrap();
+        writer.add_document(doc!(text => "must not reach durable metadata")).unwrap();
+
+        let prepared = writer.prepare_commit().unwrap();
+        let missing_component = directory
+            .inner
+            .pending_sync_paths
+            .lock()
+            .unwrap()
+            .iter()
+            .next()
+            .cloned()
+            .expect("prepared segment must have pending component files");
+        fs::remove_file(missing_component).unwrap();
+
+        assert!(prepared.commit().is_err());
+        assert!(directory.pending_sync_file_count() > 0);
+
+        drop(writer);
+        drop(index);
+        let reopened = Index::open(MmapDirectory::open(tempdir.path()).unwrap()).unwrap();
+        let reader = reopened.reader().unwrap();
+        assert_eq!(reader.searcher().num_docs(), 0);
     }
 
     #[test]

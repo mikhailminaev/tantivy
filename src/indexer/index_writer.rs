@@ -1480,6 +1480,32 @@ mod tests {
     }
 
     #[test]
+    fn sealed_snapshot_cache_rechecks_delete_overlays() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let title = schema_builder.add_text_field("title", TEXT | STORED);
+        let index = Index::create_in_ram(schema_builder.build());
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+        let mut writer = index.writer_for_tests()?;
+        let query = TermQuery::new(
+            Term::from_field_text(title, "first"),
+            IndexRecordOption::Basic,
+        );
+
+        writer.add_document(doc!(title => "first"))?;
+        let first_generation = writer.seal()?.wait()?;
+        assert_eq!(first_generation.open_searcher(&reader)?.search(&query, &Count)?, 1);
+
+        writer.delete_term(Term::from_field_text(title, "first"));
+        let deleted_generation = writer.seal()?.wait()?;
+        assert_eq!(deleted_generation.open_searcher(&reader)?.search(&query, &Count)?, 0);
+
+        Ok(())
+    }
+
+    #[test]
     fn sealed_generation_reports_materialized_documents_and_segments() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let title = schema_builder.add_text_field("title", TEXT | STORED);

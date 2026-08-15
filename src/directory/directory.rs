@@ -185,6 +185,18 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// effectively stored durably.
     fn sync_directory(&self) -> io::Result<()>;
 
+    /// Make every completed data file pending in this directory durable.
+    ///
+    /// Most directory implementations make a file durable when its writer is
+    /// terminated, so their default implementation has nothing to do. A
+    /// directory may deliberately defer that expensive operation while an
+    /// immutable, recoverable-but-not-yet-durable search generation is being
+    /// built. Before it publishes metadata that references those files, it
+    /// must synchronize them through this hook.
+    fn sync_pending_writes(&self) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Acquire a lock in the directory given in the [`Lock`].
     ///
     /// The method is blocking or not depending on the [`Lock`] object.

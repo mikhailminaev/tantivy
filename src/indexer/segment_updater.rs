@@ -1,11 +1,11 @@
 use std::any::Any;
 use std::borrow::BorrowMut;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
@@ -47,6 +47,11 @@ pub(crate) fn save_metas(metas: &IndexMeta, directory: &dyn Directory) -> crate:
             msg.unwrap_or_else(|| "Undefined".to_string())
         )
     )));
+    // A durable meta.json is the commit point for every segment it names.
+    // Directories that defer component-file fsync while building a recoverable
+    // NRT generation must complete those writes before this directory sync and
+    // atomic metadata replacement.
+    directory.sync_pending_writes()?;
     directory.sync_directory()?;
     directory.atomic_write(&META_FILEPATH, &buffer[..])?;
     debug!("Saved metas {:?}", serde_json::to_string_pretty(&metas));
@@ -277,6 +282,16 @@ pub(crate) struct InnerSegmentUpdater {
     killed: AtomicBool,
     stamper: Stamper,
     merge_operations: MergeOperationInventory,
+    // PSG snapshots are immutable. Reusing a reader is therefore safe only
+    // when the snapshot needs no transient delete overlay and the segment's
+    // durable delete generation is unchanged.
+    snapshot_reader_cache: Mutex<HashMap<SnapshotReaderCacheKey, SegmentReader>>,
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct SnapshotReaderCacheKey {
+    segment_id: SegmentId,
+    delete_opstamp: Option<Opstamp>,
 }
 
 impl SegmentUpdater {
@@ -326,6 +341,7 @@ impl SegmentUpdater {
             killed: AtomicBool::new(false),
             stamper,
             merge_operations: Default::default(),
+            snapshot_reader_cache: Mutex::new(HashMap::new()),
         })))
     }
 
@@ -376,7 +392,8 @@ impl SegmentUpdater {
     ) -> FutureResult<Vec<SegmentReader>> {
         let segment_updater = self.clone();
         self.schedule_task(move || {
-            segment_updater
+            let mut live_cache_keys = HashSet::new();
+            let readers = segment_updater
                 .segment_manager
                 .segment_entries_through_generation(generation)?
                 .into_iter()
@@ -388,9 +405,39 @@ impl SegmentUpdater {
                         target_opstamp,
                     )?
                     .map(AliveBitSet::from_bitset);
-                    SegmentReader::open_with_custom_alive_set(&segment, custom_alive_set)
+                    let key = SnapshotReaderCacheKey {
+                        segment_id: segment.id(),
+                        delete_opstamp: segment.meta().delete_opstamp(),
+                    };
+                    if custom_alive_set.is_none() {
+                        live_cache_keys.insert(key);
+                        if let Some(reader) = segment_updater
+                            .snapshot_reader_cache
+                            .lock()
+                            .expect("snapshot reader cache lock poisoned")
+                            .get(&key)
+                            .cloned()
+                        {
+                            return Ok(reader);
+                        }
+                    }
+                    let reader = SegmentReader::open_with_custom_alive_set(&segment, custom_alive_set)?;
+                    if live_cache_keys.contains(&key) {
+                        segment_updater
+                            .snapshot_reader_cache
+                            .lock()
+                            .expect("snapshot reader cache lock poisoned")
+                            .insert(key, reader.clone());
+                    }
+                    Ok(reader)
                 })
-                .collect::<crate::Result<_>>()
+                .collect::<crate::Result<Vec<_>>>()?;
+            segment_updater
+                .snapshot_reader_cache
+                .lock()
+                .expect("snapshot reader cache lock poisoned")
+                .retain(|key, _| live_cache_keys.contains(key));
+            Ok(readers)
         })
     }
 
