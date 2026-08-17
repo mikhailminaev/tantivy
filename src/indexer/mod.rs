@@ -34,13 +34,14 @@ use crossbeam_channel as channel;
 use smallvec::SmallVec;
 
 pub use self::index_writer::{
-    advance_deletes, CompletedGeneration, IndexWriter, IndexWriterOptions, SealedGeneration,
+    advance_deletes, CompletedGeneration, GenerationOpenSearcherStats, IndexWriter,
+    IndexWriterOptions, PrepareCommitStats, SealedGeneration,
 };
 pub use self::log_merge_policy::LogMergePolicy;
 pub use self::merge_operation::MergeOperation;
 pub use self::merge_policy::{MergeCandidate, MergePolicy, NoMergePolicy};
 pub use self::operation::{AddOperation, DeleteOperation, UserOperation};
-pub use self::prepared_commit::PreparedCommit;
+pub use self::prepared_commit::{CommitStats, PreparedCommit};
 pub use self::segment_entry::SegmentEntry;
 pub(crate) use self::segment_serializer::SegmentSerializer;
 pub use self::segment_updater::{merge_filtered_segments, merge_indices};

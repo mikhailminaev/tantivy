@@ -6,6 +6,7 @@ use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
@@ -13,7 +14,10 @@ use super::segment_manager::SegmentManager;
 use crate::core::META_FILEPATH;
 use crate::directory::{Directory, DirectoryClone, GarbageCollectionResult};
 use crate::fastfield::AliveBitSet;
-use crate::index::{Index, IndexMeta, IndexSettings, Segment, SegmentId, SegmentMeta, SegmentReader};
+use crate::index::{
+    Index, IndexMeta, IndexSettings, Segment, SegmentId, SegmentMeta, SegmentReader,
+    SegmentReaderOpenStats,
+};
 use crate::indexer::delete_queue::DeleteCursor;
 use crate::indexer::index_writer::{advance_deletes, compute_alive_bitset};
 use crate::indexer::merge_operation::MergeOperationInventory;
@@ -294,6 +298,44 @@ struct SnapshotReaderCacheKey {
     delete_opstamp: Option<Opstamp>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SnapshotReaderStats {
+    pub(crate) segment_entries: u64,
+    pub(crate) delete_overlay: Duration,
+    pub(crate) cache_lookup: Duration,
+    pub(crate) reader_open: Duration,
+    pub(crate) cache_insert: Duration,
+    pub(crate) cache_prune: Duration,
+    pub(crate) reader_cache_hits: u64,
+    pub(crate) reader_cache_misses: u64,
+    pub(crate) termdict_open: Duration,
+    pub(crate) store_open: Duration,
+    pub(crate) postings_open: Duration,
+    pub(crate) positions_open: Duration,
+    pub(crate) fast_fields_open: Duration,
+    pub(crate) fieldnorms_open: Duration,
+    pub(crate) delete_open: Duration,
+    pub(crate) alive_bitset_intersection: Duration,
+}
+
+impl SnapshotReaderStats {
+    fn record_reader_open(&mut self, reader: SegmentReaderOpenStats) {
+        self.termdict_open += reader.termdict_open;
+        self.store_open += reader.store_open;
+        self.postings_open += reader.postings_open;
+        self.positions_open += reader.positions_open;
+        self.fast_fields_open += reader.fast_fields_open;
+        self.fieldnorms_open += reader.fieldnorms_open;
+        self.delete_open += reader.delete_open;
+        self.alive_bitset_intersection += reader.alive_bitset_intersection;
+    }
+}
+
+pub(crate) struct SnapshotReaders {
+    pub(crate) readers: Vec<SegmentReader>,
+    pub(crate) stats: SnapshotReaderStats,
+}
+
 impl SegmentUpdater {
     pub fn create(
         index: Index,
@@ -389,28 +431,33 @@ impl SegmentUpdater {
         &self,
         target_opstamp: Opstamp,
         generation: PublicationGeneration,
-    ) -> FutureResult<Vec<SegmentReader>> {
+    ) -> FutureResult<SnapshotReaders> {
         let segment_updater = self.clone();
         self.schedule_task(move || {
             let mut live_cache_keys = HashSet::new();
+            let mut stats = SnapshotReaderStats::default();
             let readers = segment_updater
                 .segment_manager
                 .segment_entries_through_generation(generation)?
                 .into_iter()
                 .map(|mut segment_entry| {
+                    stats.segment_entries += 1;
                     let segment = segment_updater.index.segment(segment_entry.meta().clone());
+                    let delete_overlay_started = Instant::now();
                     let custom_alive_set = compute_alive_bitset(
                         &segment,
                         &mut segment_entry,
                         target_opstamp,
                     )?
                     .map(AliveBitSet::from_bitset);
+                    stats.delete_overlay += delete_overlay_started.elapsed();
                     let key = SnapshotReaderCacheKey {
                         segment_id: segment.id(),
                         delete_opstamp: segment.meta().delete_opstamp(),
                     };
                     if custom_alive_set.is_none() {
                         live_cache_keys.insert(key);
+                        let cache_lookup_started = Instant::now();
                         if let Some(reader) = segment_updater
                             .snapshot_reader_cache
                             .lock()
@@ -418,26 +465,38 @@ impl SegmentUpdater {
                             .get(&key)
                             .cloned()
                         {
+                            stats.cache_lookup += cache_lookup_started.elapsed();
+                            stats.reader_cache_hits += 1;
                             return Ok(reader);
                         }
+                        stats.cache_lookup += cache_lookup_started.elapsed();
                     }
-                    let reader = SegmentReader::open_with_custom_alive_set(&segment, custom_alive_set)?;
+                    stats.reader_cache_misses += 1;
+                    let reader_open_started = Instant::now();
+                    let (reader, reader_stats) =
+                        SegmentReader::open_with_custom_alive_set_with_stats(&segment, custom_alive_set)?;
+                    stats.reader_open += reader_open_started.elapsed();
+                    stats.record_reader_open(reader_stats);
                     if live_cache_keys.contains(&key) {
+                        let cache_insert_started = Instant::now();
                         segment_updater
                             .snapshot_reader_cache
                             .lock()
                             .expect("snapshot reader cache lock poisoned")
                             .insert(key, reader.clone());
+                        stats.cache_insert += cache_insert_started.elapsed();
                     }
                     Ok(reader)
                 })
                 .collect::<crate::Result<Vec<_>>>()?;
+            let cache_prune_started = Instant::now();
             segment_updater
                 .snapshot_reader_cache
                 .lock()
                 .expect("snapshot reader cache lock poisoned")
                 .retain(|key, _| live_cache_keys.contains(key));
-            Ok(readers)
+            stats.cache_prune = cache_prune_started.elapsed();
+            Ok(SnapshotReaders { readers, stats })
         })
     }
 

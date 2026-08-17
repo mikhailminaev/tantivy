@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 use std::{fmt, io};
 
 use common::{ByteCount, HasLen};
@@ -47,6 +48,23 @@ pub struct SegmentReader {
     store_file: FileSlice,
     alive_bitset_opt: Option<AliveBitSet>,
     schema: Schema,
+}
+
+/// Time spent opening the immutable component readers of one segment.
+///
+/// This is intentionally crate-private: it exists to make Ampere's snapshot
+/// publication diagnostics precise without expanding Tantivy's public reader
+/// API for a profiling-only concern.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SegmentReaderOpenStats {
+    pub(crate) termdict_open: Duration,
+    pub(crate) store_open: Duration,
+    pub(crate) postings_open: Duration,
+    pub(crate) positions_open: Duration,
+    pub(crate) fast_fields_open: Duration,
+    pub(crate) fieldnorms_open: Duration,
+    pub(crate) delete_open: Duration,
+    pub(crate) alive_bitset_intersection: Duration,
 }
 
 impl SegmentReader {
@@ -149,16 +167,32 @@ impl SegmentReader {
         segment: &Segment,
         custom_bitset: Option<AliveBitSet>,
     ) -> crate::Result<SegmentReader> {
+        Self::open_with_custom_alive_set_with_stats(segment, custom_bitset)
+            .map(|(reader, _stats)| reader)
+    }
+
+    pub(crate) fn open_with_custom_alive_set_with_stats(
+        segment: &Segment,
+        custom_bitset: Option<AliveBitSet>,
+    ) -> crate::Result<(SegmentReader, SegmentReaderOpenStats)> {
+        let mut stats = SegmentReaderOpenStats::default();
+        let termdict_started = Instant::now();
         let termdict_file = segment.open_read(SegmentComponent::Terms)?;
         let termdict_composite = CompositeFile::open(&termdict_file)?;
+        stats.termdict_open = termdict_started.elapsed();
 
+        let store_started = Instant::now();
         let store_file = segment.open_read(SegmentComponent::Store)?;
+        stats.store_open = store_started.elapsed();
 
         crate::fail_point!("SegmentReader::open#middle");
 
+        let postings_started = Instant::now();
         let postings_file = segment.open_read(SegmentComponent::Postings)?;
         let postings_composite = CompositeFile::open(&postings_file)?;
+        stats.postings_open = postings_started.elapsed();
 
+        let positions_started = Instant::now();
         let positions_composite = {
             if let Ok(positions_file) = segment.open_read(SegmentComponent::Positions) {
                 CompositeFile::open(&positions_file)?
@@ -166,14 +200,20 @@ impl SegmentReader {
                 CompositeFile::empty()
             }
         };
+        stats.positions_open = positions_started.elapsed();
 
         let schema = segment.schema();
 
+        let fast_fields_started = Instant::now();
         let fast_fields_data = segment.open_read(SegmentComponent::FastFields)?;
         let fast_fields_readers = FastFieldReaders::open(fast_fields_data, schema.clone())?;
+        stats.fast_fields_open = fast_fields_started.elapsed();
+        let fieldnorms_started = Instant::now();
         let fieldnorm_data = segment.open_read(SegmentComponent::FieldNorms)?;
         let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
+        stats.fieldnorms_open = fieldnorms_started.elapsed();
 
+        let delete_started = Instant::now();
         let original_bitset = if segment.meta().has_deletes() {
             let alive_doc_file_slice = segment.open_read(SegmentComponent::Delete)?;
             let alive_doc_data = alive_doc_file_slice.read_bytes()?;
@@ -181,8 +221,11 @@ impl SegmentReader {
         } else {
             None
         };
+        stats.delete_open = delete_started.elapsed();
 
+        let alive_bitset_started = Instant::now();
         let alive_bitset_opt = intersect_alive_bitset(original_bitset, custom_bitset);
+        stats.alive_bitset_intersection = alive_bitset_started.elapsed();
 
         let max_doc = segment.meta().max_doc();
         let num_docs = alive_bitset_opt
@@ -190,7 +233,7 @@ impl SegmentReader {
             .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
             .unwrap_or(max_doc);
 
-        Ok(SegmentReader {
+        Ok((SegmentReader {
             inv_idx_reader_cache: Default::default(),
             num_docs,
             max_doc,
@@ -204,7 +247,7 @@ impl SegmentReader {
             alive_bitset_opt,
             positions_composite,
             schema,
-        })
+        }, stats))
     }
 
     /// Returns a field reader associated with the field given in argument.

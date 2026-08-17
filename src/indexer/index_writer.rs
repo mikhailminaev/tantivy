@@ -441,6 +441,64 @@ pub struct CompletedGeneration {
     worker_stats: GenerationWorkerStats,
 }
 
+/// Breakdown of building an immutable searcher for a completed generation.
+///
+/// The component durations are summed across snapshot segments. They equal
+/// the critical path with Tantivy's single segment-updater worker and remain
+/// useful work-volume diagnostics if that implementation changes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GenerationOpenSearcherStats {
+    /// Time from scheduling the snapshot task until its readers are available.
+    pub snapshot_task_wait: Duration,
+    /// Time to assemble a searcher from the completed snapshot readers.
+    pub searcher_assembly: Duration,
+    /// Number of segment entries considered by the snapshot task.
+    pub segment_entries: u64,
+    /// Time spent computing transient delete overlays.
+    pub delete_overlay: Duration,
+    /// Time spent looking up reusable immutable readers.
+    pub reader_cache_lookup: Duration,
+    /// Time spent opening readers that were not reusable from the cache.
+    pub reader_open: Duration,
+    /// Time spent retaining newly opened immutable readers in the cache.
+    pub reader_cache_insert: Duration,
+    /// Time spent pruning readers no longer reachable by the current snapshot.
+    pub reader_cache_prune: Duration,
+    /// Number of immutable reader cache hits.
+    pub reader_cache_hits: u64,
+    /// Number of immutable reader cache misses.
+    pub reader_cache_misses: u64,
+    /// Aggregate time opening term dictionaries.
+    pub termdict_open: Duration,
+    /// Aggregate time opening document stores.
+    pub store_open: Duration,
+    /// Aggregate time opening postings.
+    pub postings_open: Duration,
+    /// Aggregate time opening positions.
+    pub positions_open: Duration,
+    /// Aggregate time opening fast fields.
+    pub fast_fields_open: Duration,
+    /// Aggregate time opening field norms.
+    pub fieldnorms_open: Duration,
+    /// Aggregate time reading durable delete bitsets.
+    pub delete_open: Duration,
+    /// Aggregate time intersecting durable and transient alive bitsets.
+    pub alive_bitset_intersection: Duration,
+}
+
+/// Breakdown of preparing a durable Tantivy commit.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PrepareCommitStats {
+    /// Time spent waiting for previously sealed generations.
+    pub sealed_generation_wait: Duration,
+    /// Time spent rotating the document channel at the commit boundary.
+    pub document_channel_recreate: Duration,
+    /// Time spent joining stopped indexing workers.
+    pub worker_join: Duration,
+    /// Time spent starting successor indexing workers.
+    pub worker_restart: Duration,
+}
+
 impl SealedGeneration {
     /// Waits for all workers in this generation to finish writing their segments.
     pub fn wait(self) -> crate::Result<CompletedGeneration> {
@@ -465,11 +523,47 @@ impl CompletedGeneration {
         &self,
         reader: &crate::reader::IndexReader,
     ) -> crate::Result<crate::Searcher> {
-        let segment_readers = self
+        self.open_searcher_with_stats(reader)
+            .map(|(searcher, _stats)| searcher)
+    }
+
+    /// Opens a searcher and reports the snapshot construction breakdown.
+    pub fn open_searcher_with_stats(
+        &self,
+        reader: &crate::reader::IndexReader,
+    ) -> crate::Result<(crate::Searcher, GenerationOpenSearcherStats)> {
+        let snapshot_started = Instant::now();
+        let snapshot = self
             .segment_updater
             .schedule_snapshot_segment_readers_through_generation(self.opstamp, self.generation)
             .wait()?;
-        reader.searcher_for_segment_readers(segment_readers)
+        let searcher_assembly_started = Instant::now();
+        let searcher = reader.searcher_for_segment_readers(snapshot.readers)?;
+        let snapshot_stats = snapshot.stats;
+        Ok((
+            searcher,
+            GenerationOpenSearcherStats {
+                snapshot_task_wait: searcher_assembly_started
+                    .saturating_duration_since(snapshot_started),
+                searcher_assembly: searcher_assembly_started.elapsed(),
+                segment_entries: snapshot_stats.segment_entries,
+                delete_overlay: snapshot_stats.delete_overlay,
+                reader_cache_lookup: snapshot_stats.cache_lookup,
+                reader_open: snapshot_stats.reader_open,
+                reader_cache_insert: snapshot_stats.cache_insert,
+                reader_cache_prune: snapshot_stats.cache_prune,
+                reader_cache_hits: snapshot_stats.reader_cache_hits,
+                reader_cache_misses: snapshot_stats.reader_cache_misses,
+                termdict_open: snapshot_stats.termdict_open,
+                store_open: snapshot_stats.store_open,
+                postings_open: snapshot_stats.postings_open,
+                positions_open: snapshot_stats.positions_open,
+                fast_fields_open: snapshot_stats.fast_fields_open,
+                fieldnorms_open: snapshot_stats.fieldnorms_open,
+                delete_open: snapshot_stats.delete_open,
+                alive_bitset_intersection: snapshot_stats.alive_bitset_intersection,
+            },
+        ))
     }
 }
 
@@ -1097,6 +1191,17 @@ impl<D: Document> IndexWriter<D> {
     /// using this API.
     /// See [`PreparedCommit::set_payload()`].
     pub fn prepare_commit(&mut self) -> crate::Result<PreparedCommit<'_, D>> {
+        self.prepare_commit_with_stats()
+            .map(|(prepared, _stats)| prepared)
+    }
+
+    /// Prepares a commit and reports the work required to rotate the indexing
+    /// pipeline. This keeps the regular commit API unchanged while allowing
+    /// storage owners to distinguish worker coordination from durable I/O.
+    pub fn prepare_commit_with_stats(
+        &mut self,
+    ) -> crate::Result<(PreparedCommit<'_, D>, PrepareCommitStats)> {
+        let mut stats = PrepareCommitStats::default();
         // Here, because we join all of the worker threads,
         // all of the segment update for this commit have been
         // sent.
@@ -1108,12 +1213,16 @@ impl<D: Document> IndexWriter<D> {
         // This will move uncommitted segments to the state of
         // committed segments.
         info!("Preparing commit");
+        let sealed_generation_wait_started = Instant::now();
         self.wait_for_sealed_generations()?;
+        stats.sealed_generation_wait = sealed_generation_wait_started.elapsed();
 
         // this will drop the current document channel
         // and recreate a new one.
         let prepared_generation = self.publication_generation;
+        let document_channel_recreate_started = Instant::now();
         self.recreate_document_channel();
+        stats.document_channel_recreate = document_channel_recreate_started.elapsed();
 
         let former_workers_join_handle = std::mem::take(&mut self.workers_join_handle);
 
@@ -1122,17 +1231,21 @@ impl<D: Document> IndexWriter<D> {
         })?;
 
         for worker_handle in former_workers_join_handle {
+            let worker_join_started = Instant::now();
             let _stats = worker_handle
                 .join()
                 .map_err(|e| TantivyError::ErrorInThread(format!("{e:?}")))?;
             _stats?;
+            stats.worker_join += worker_join_started.elapsed();
+            let worker_restart_started = Instant::now();
             self.add_indexing_worker()?;
+            stats.worker_restart += worker_restart_started.elapsed();
         }
 
         let commit_opstamp = self.stamper.stamp();
         let prepared_commit = PreparedCommit::new(self, commit_opstamp, prepared_generation);
         info!("Prepared commit {commit_opstamp}");
-        Ok(prepared_commit)
+        Ok((prepared_commit, stats))
     }
 
     /// Cuts the active indexing pipeline and starts its successor without waiting for the cut

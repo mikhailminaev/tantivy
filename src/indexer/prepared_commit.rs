@@ -1,4 +1,5 @@
 use super::IndexWriter;
+use std::time::{Duration, Instant};
 use crate::reader::IndexReader;
 use crate::schema::document::Document;
 use crate::indexer::segment_entry::PublicationGeneration;
@@ -10,6 +11,15 @@ pub struct PreparedCommit<'a, D: Document = TantivyDocument> {
     payload: Option<String>,
     opstamp: Opstamp,
     publication_generation: PublicationGeneration,
+}
+
+/// Breakdown of the durable half of a prepared commit.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CommitStats {
+    /// Time to enqueue the commit on Tantivy's segment updater.
+    pub schedule: Duration,
+    /// Time waiting for the scheduled commit to persist its metadata.
+    pub wait: Duration,
 }
 
 impl<'a, D: Document> PreparedCommit<'a, D> {
@@ -49,7 +59,7 @@ impl<'a, D: Document> PreparedCommit<'a, D> {
     /// [`Self::abort`] after publishing such a searcher is invalid: it would discard the logical
     /// writer state represented by the published view.
     pub fn open_searcher(&self, reader: &IndexReader) -> crate::Result<Searcher> {
-        let segment_readers = self
+        let snapshot = self
             .index_writer
             .segment_updater()
             .schedule_snapshot_segment_readers_through_generation(
@@ -57,7 +67,7 @@ impl<'a, D: Document> PreparedCommit<'a, D> {
                 self.publication_generation,
             )
             .wait()?;
-        reader.searcher_for_segment_readers(segment_readers)
+        reader.searcher_for_segment_readers(snapshot.readers)
     }
 
     /// Rollbacks any change.
@@ -68,7 +78,24 @@ impl<'a, D: Document> PreparedCommit<'a, D> {
     /// Proceeds to commit.
     /// See `.commit_future()`.
     pub fn commit(self) -> crate::Result<Opstamp> {
-        self.commit_future().wait()
+        self.commit_with_stats().map(|(opstamp, _stats)| opstamp)
+    }
+
+    /// Commits and reports scheduler submission separately from the durable
+    /// segment-updater wait.
+    pub fn commit_with_stats(self) -> crate::Result<(Opstamp, CommitStats)> {
+        let schedule_started = Instant::now();
+        let commit = self.commit_future();
+        let schedule = schedule_started.elapsed();
+        let wait_started = Instant::now();
+        let opstamp = commit.wait()?;
+        Ok((
+            opstamp,
+            CommitStats {
+                schedule,
+                wait: wait_started.elapsed(),
+            },
+        ))
     }
 
     /// Proceeds to commit.

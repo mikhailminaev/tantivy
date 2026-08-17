@@ -17,4 +17,5 @@ pub use self::inverted_index_reader::InvertedIndexReader;
 pub use self::segment::Segment;
 pub use self::segment_component::SegmentComponent;
 pub use self::segment_id::SegmentId;
+pub(crate) use self::segment_reader::SegmentReaderOpenStats;
 pub use self::segment_reader::{FieldMetadata, SegmentReader};
