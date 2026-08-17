@@ -613,23 +613,27 @@ pub(crate) fn compute_alive_bitset(
     segment_entry: &mut SegmentEntry,
     target_opstamp: Opstamp,
 ) -> crate::Result<Option<BitSet>> {
-    if segment_entry.meta().delete_opstamp() == Some(target_opstamp) {
-        // We are already up-to-date here.
+    if !requires_delete_overlay(segment_entry, target_opstamp) {
         return Ok(None);
     }
-
-    if segment_entry.alive_bitset().is_none()
-        && !segment_entry
-            .delete_cursor()
-            .has_operation_through(target_opstamp)
-    {
-        // There has been no DeleteOperation between the segment status and the requested
-        // publication boundary. The cursor can still point at a later delete operation, which
-        // must not force opening every immutable component just to discover it is in the future.
-        return Ok(None);
-    }
-
     let segment_reader = SegmentReader::open(segment)?;
+    compute_alive_bitset_with_reader(segment, segment_entry, target_opstamp, &segment_reader)
+}
+
+/// Computes the delete overlay with an immutable reader for the segment's durable state.
+///
+/// PSG snapshot construction can reuse its reader cache here. The caller must only provide a
+/// reader whose segment id and durable delete opstamp match `segment`; transient overlays are not
+/// valid inputs because this function derives a new overlay for one publication boundary.
+pub(crate) fn compute_alive_bitset_with_reader(
+    segment: &Segment,
+    segment_entry: &mut SegmentEntry,
+    target_opstamp: Opstamp,
+    segment_reader: &SegmentReader,
+) -> crate::Result<Option<BitSet>> {
+    if !requires_delete_overlay(segment_entry, target_opstamp) {
+        return Ok(None);
+    }
 
     let max_doc = segment_reader.max_doc();
     let mut alive_bitset: BitSet = match segment_entry.alive_bitset() {
@@ -639,7 +643,7 @@ pub(crate) fn compute_alive_bitset(
 
     compute_deleted_bitset(
         &mut alive_bitset,
-        &segment_reader,
+        segment_reader,
         segment_entry.delete_cursor(),
         &DocToOpstampMapping::None,
         target_opstamp,
@@ -651,6 +655,25 @@ pub(crate) fn compute_alive_bitset(
 
     let num_deleted_docs = max_doc - alive_bitset.len() as u32;
     Ok((num_deleted_docs > segment.meta().num_deleted_docs()).then_some(alive_bitset))
+}
+
+fn requires_delete_overlay(segment_entry: &mut SegmentEntry, target_opstamp: Opstamp) -> bool {
+    if segment_entry.meta().delete_opstamp() == Some(target_opstamp) {
+        // We are already up-to-date here.
+        return false;
+    }
+
+    if segment_entry.alive_bitset().is_none()
+        && !segment_entry
+            .delete_cursor()
+            .has_operation_through(target_opstamp)
+    {
+        // There has been no DeleteOperation between the segment status and the requested
+        // publication boundary. The cursor can still point at a later delete operation, which
+        // must not force opening every immutable component just to discover it is in the future.
+        return false;
+    }
+    true
 }
 
 /// Advance delete for the given segment up to the target opstamp and persist the resulting

@@ -19,7 +19,9 @@ use crate::index::{
     SegmentReaderOpenStats,
 };
 use crate::indexer::delete_queue::DeleteCursor;
-use crate::indexer::index_writer::{advance_deletes, compute_alive_bitset};
+use crate::indexer::index_writer::{
+    advance_deletes, compute_alive_bitset, compute_alive_bitset_with_reader,
+};
 use crate::indexer::merge_operation::MergeOperationInventory;
 use crate::indexer::merger::IndexMerger;
 use crate::indexer::segment_manager::SegmentsStatus;
@@ -443,35 +445,41 @@ impl SegmentUpdater {
                 .map(|mut segment_entry| {
                     stats.segment_entries += 1;
                     let segment = segment_updater.index.segment(segment_entry.meta().clone());
-                    let delete_overlay_started = Instant::now();
-                    let custom_alive_set = compute_alive_bitset(
-                        &segment,
-                        &mut segment_entry,
-                        target_opstamp,
-                    )?
-                    .map(AliveBitSet::from_bitset);
-                    stats.delete_overlay += delete_overlay_started.elapsed();
                     let key = SnapshotReaderCacheKey {
                         segment_id: segment.id(),
                         delete_opstamp: segment.meta().delete_opstamp(),
                     };
+                    let cache_lookup_started = Instant::now();
+                    let cached_reader = segment_updater
+                        .snapshot_reader_cache
+                        .lock()
+                        .expect("snapshot reader cache lock poisoned")
+                        .get(&key)
+                        .cloned();
+                    stats.cache_lookup += cache_lookup_started.elapsed();
+                    if cached_reader.is_some() {
+                        stats.reader_cache_hits += 1;
+                    } else {
+                        stats.reader_cache_misses += 1;
+                    }
+                    let delete_overlay_started = Instant::now();
+                    let custom_alive_set = match cached_reader.as_ref() {
+                        Some(reader) => compute_alive_bitset_with_reader(
+                            &segment,
+                            &mut segment_entry,
+                            target_opstamp,
+                            reader,
+                        )?,
+                        None => compute_alive_bitset(&segment, &mut segment_entry, target_opstamp)?,
+                    }
+                    .map(AliveBitSet::from_bitset);
+                    stats.delete_overlay += delete_overlay_started.elapsed();
                     if custom_alive_set.is_none() {
                         live_cache_keys.insert(key);
-                        let cache_lookup_started = Instant::now();
-                        if let Some(reader) = segment_updater
-                            .snapshot_reader_cache
-                            .lock()
-                            .expect("snapshot reader cache lock poisoned")
-                            .get(&key)
-                            .cloned()
-                        {
-                            stats.cache_lookup += cache_lookup_started.elapsed();
-                            stats.reader_cache_hits += 1;
+                        if let Some(reader) = cached_reader {
                             return Ok(reader);
                         }
-                        stats.cache_lookup += cache_lookup_started.elapsed();
                     }
-                    stats.reader_cache_misses += 1;
                     let reader_open_started = Instant::now();
                     let (reader, reader_stats) =
                         SegmentReader::open_with_custom_alive_set_with_stats(&segment, custom_alive_set)?;
