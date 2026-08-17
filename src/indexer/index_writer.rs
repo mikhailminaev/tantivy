@@ -618,8 +618,14 @@ pub(crate) fn compute_alive_bitset(
         return Ok(None);
     }
 
-    if segment_entry.alive_bitset().is_none() && segment_entry.delete_cursor().get().is_none() {
-        // There has been no `DeleteOperation` between the segment status and `target_opstamp`.
+    if segment_entry.alive_bitset().is_none()
+        && !segment_entry
+            .delete_cursor()
+            .has_operation_through(target_opstamp)
+    {
+        // There has been no DeleteOperation between the segment status and the requested
+        // publication boundary. The cursor can still point at a later delete operation, which
+        // must not force opening every immutable component just to discover it is in the future.
         return Ok(None);
     }
 
@@ -1465,11 +1471,12 @@ mod tests {
     use proptest::prop_oneof;
 
     use super::super::operation::UserOperation;
+    use super::compute_alive_bitset;
     use crate::collector::{Count, TopDocs};
     use crate::directory::error::LockError;
     use crate::error::*;
     use crate::indexer::index_writer::MEMORY_BUDGET_NUM_BYTES_MIN;
-    use crate::indexer::{IndexWriterOptions, NoMergePolicy};
+    use crate::indexer::{IndexWriterOptions, NoMergePolicy, SegmentEntry};
     use crate::query::{QueryParser, TermQuery};
     use crate::schema::{
         self, Facet, FacetOptions, IndexRecordOption, IpAddrOptions, JsonObjectOptions,
@@ -1503,6 +1510,28 @@ mod tests {
         ];
         let batch_opstamp1 = index_writer.run(operations).unwrap();
         assert_eq!(batch_opstamp1, 2u64);
+    }
+
+    #[test]
+    fn future_delete_does_not_open_a_snapshot_segment_reader() -> crate::Result<()> {
+        let mut schema_builder = schema::Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let writer: IndexWriter<TantivyDocument> = index.writer_for_tests()?;
+        writer.add_document(doc!(text => "seed"))?;
+        let segment = index.new_segment().with_max_doc(1);
+        let mut entry = SegmentEntry::new(
+            segment.meta().clone(),
+            writer.delete_queue.cursor(),
+            None,
+        );
+
+        let delete_opstamp = writer.delete_term(Term::from_field_text(text, "future"));
+
+        // The segment has no files, so opening a SegmentReader would fail. A delete after the
+        // requested publication boundary must be ignored without touching the segment.
+        assert!(compute_alive_bitset(&segment, &mut entry, delete_opstamp - 1)?.is_none());
+        Ok(())
     }
 
     #[test]

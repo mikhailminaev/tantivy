@@ -238,6 +238,14 @@ impl DeleteCursor {
             None
         }
     }
+
+    /// Returns whether the next pending delete belongs to the requested
+    /// opstamp boundary. Delete operations are appended in opstamp order, so a
+    /// later first operation proves that no remaining delete can affect it.
+    pub(crate) fn has_operation_through(&mut self, target_opstamp: Opstamp) -> bool {
+        self.get()
+            .is_some_and(|operation| operation.opstamp <= target_opstamp)
+    }
 }
 
 #[cfg(test)]
@@ -275,6 +283,8 @@ mod tests {
         {
             let mut operations_it = snapshot.clone();
             assert_eq!(operations_it.get().unwrap().opstamp, 1);
+            assert!(!operations_it.has_operation_through(0));
+            assert!(operations_it.has_operation_through(1));
             operations_it.advance();
             assert_eq!(operations_it.get().unwrap().opstamp, 2);
             operations_it.advance();
