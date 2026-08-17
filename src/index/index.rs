@@ -10,9 +10,11 @@ use super::segment_reader::merge_field_meta_data;
 use super::{FieldMetadata, IndexSettings};
 use crate::core::{Executor, META_FILEPATH};
 use crate::directory::error::OpenReadError;
+use crate::directory::{
+    Directory, ManagedDirectory, ManagedFileRegistrationDurability, RamDirectory, INDEX_WRITER_LOCK,
+};
 #[cfg(feature = "mmap")]
 use crate::directory::{MmapDirectory, MmapWriteDurability};
-use crate::directory::{Directory, ManagedDirectory, RamDirectory, INDEX_WRITER_LOCK};
 use crate::error::{DataCorruption, TantivyError};
 use crate::index::{IndexMeta, SegmentId, SegmentMeta, SegmentMetaInventory};
 use crate::indexer::index_writer::{
@@ -187,7 +189,10 @@ impl IndexBuilder {
         if Index::exists(&*mmap_directory)? {
             return Err(TantivyError::IndexAlreadyExists);
         }
-        self.create(mmap_directory)
+        self.create_with_managed_file_registration_durability(
+            mmap_directory,
+            managed_file_registration_durability(write_durability),
+        )
     }
 
     /// Dragons ahead!!!
@@ -262,9 +267,21 @@ impl IndexBuilder {
     ///
     /// If a directory previously existed, it will be erased.
     fn create<T: Into<Box<dyn Directory>>>(self, dir: T) -> crate::Result<Index> {
+        self.create_with_managed_file_registration_durability(
+            dir,
+            ManagedFileRegistrationDurability::Immediate,
+        )
+    }
+
+    fn create_with_managed_file_registration_durability<T: Into<Box<dyn Directory>>>(
+        self,
+        dir: T,
+        registration_durability: ManagedFileRegistrationDurability,
+    ) -> crate::Result<Index> {
         self.validate()?;
         let dir = dir.into();
-        let directory = ManagedDirectory::wrap(dir)?;
+        let directory =
+            ManagedDirectory::wrap_with_registration_durability(dir, registration_durability)?;
         save_new_metas(
             self.get_expect_schema()?,
             self.index_settings.clone(),
@@ -505,7 +522,10 @@ impl Index {
     ) -> crate::Result<Index> {
         let mmap_directory =
             MmapDirectory::open_with_write_durability(directory_path, write_durability)?;
-        Index::open(mmap_directory)
+        Index::open_with_managed_file_registration_durability(
+            mmap_directory,
+            managed_file_registration_durability(write_durability),
+        )
     }
 
     /// Returns the list of the segment metas tracked by the index.
@@ -550,8 +570,21 @@ impl Index {
 
     /// Open the index using the provided directory
     pub fn open<T: Into<Box<dyn Directory>>>(directory: T) -> crate::Result<Index> {
+        Self::open_with_managed_file_registration_durability(
+            directory,
+            ManagedFileRegistrationDurability::Immediate,
+        )
+    }
+
+    fn open_with_managed_file_registration_durability<T: Into<Box<dyn Directory>>>(
+        directory: T,
+        registration_durability: ManagedFileRegistrationDurability,
+    ) -> crate::Result<Index> {
         let directory = directory.into();
-        let directory = ManagedDirectory::wrap(directory)?;
+        let directory = ManagedDirectory::wrap_with_registration_durability(
+            directory,
+            registration_durability,
+        )?;
         let inventory = SegmentMetaInventory::default();
         let metas = load_metas(&directory, &inventory)?;
         let index = Index::open_from_metas(directory, &metas, inventory);
@@ -746,6 +779,16 @@ impl Index {
             }
         }
         Ok(damaged_files)
+    }
+}
+
+#[cfg(feature = "mmap")]
+fn managed_file_registration_durability(
+    write_durability: MmapWriteDurability,
+) -> ManagedFileRegistrationDurability {
+    match write_durability {
+        MmapWriteDurability::Immediate => ManagedFileRegistrationDurability::Immediate,
+        MmapWriteDurability::Deferred => ManagedFileRegistrationDurability::Deferred,
     }
 }
 

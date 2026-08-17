@@ -40,11 +40,28 @@ fn is_managed(path: &Path) -> bool {
 pub struct ManagedDirectory {
     directory: Box<dyn Directory>,
     meta_informations: Arc<RwLock<MetaInformation>>,
+    registration_durability: ManagedFileRegistrationDurability,
 }
 
 #[derive(Debug, Default)]
 struct MetaInformation {
     managed_paths: HashSet<PathBuf>,
+    registration_needs_persist: bool,
+}
+
+/// Durability policy for the garbage-collection manifest.
+///
+/// Deferred registration is only safe for an index with an independent
+/// recovery source for unpublished writes. Before durable metadata can name a
+/// component, [`Directory::sync_pending_writes`] persists all registrations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ManagedFileRegistrationDurability {
+    /// Persist every new file registration before creating that file.
+    #[default]
+    Immediate,
+    /// Keep registrations visible in-process and persist them at the durable
+    /// metadata barrier.
+    Deferred,
 }
 
 /// Saves the file containing the list of existing files
@@ -62,6 +79,16 @@ fn save_managed_paths(
 impl ManagedDirectory {
     /// Wraps a directory as managed directory.
     pub fn wrap(directory: Box<dyn Directory>) -> crate::Result<ManagedDirectory> {
+        Self::wrap_with_registration_durability(
+            directory,
+            ManagedFileRegistrationDurability::Immediate,
+        )
+    }
+
+    pub(crate) fn wrap_with_registration_durability(
+        directory: Box<dyn Directory>,
+        registration_durability: ManagedFileRegistrationDurability,
+    ) -> crate::Result<ManagedDirectory> {
         match directory.atomic_read(&MANAGED_FILEPATH) {
             Ok(data) => {
                 let managed_files_json = String::from_utf8_lossy(&data);
@@ -76,12 +103,15 @@ impl ManagedDirectory {
                     directory,
                     meta_informations: Arc::new(RwLock::new(MetaInformation {
                         managed_paths: managed_files,
+                        registration_needs_persist: false,
                     })),
+                    registration_durability,
                 })
             }
             Err(OpenReadError::FileDoesNotExist(_)) => Ok(ManagedDirectory {
                 directory,
                 meta_informations: Arc::default(),
+                registration_durability,
             }),
             io_err @ Err(OpenReadError::IoError { .. }) => Err(io_err.err().unwrap().into()),
             Err(OpenReadError::IncompatibleIndex(incompatibility)) => {
@@ -191,6 +221,7 @@ impl ManagedDirectory {
             }
             self.directory.sync_directory()?;
             save_managed_paths(self.directory.as_mut(), &meta_informations_wlock)?;
+            meta_informations_wlock.registration_needs_persist = false;
         }
 
         Ok(GarbageCollectionResult {
@@ -223,6 +254,10 @@ impl ManagedDirectory {
         if !has_changed {
             return Ok(());
         }
+        if self.registration_durability == ManagedFileRegistrationDurability::Deferred {
+            meta_wlock.registration_needs_persist = true;
+            return Ok(());
+        }
         save_managed_paths(self.directory.as_ref(), &meta_wlock)?;
         // This is not the first file we add.
         // Therefore, we are sure that `.managed.json` has been already
@@ -237,6 +272,19 @@ impl ManagedDirectory {
         }
         self.directory.sync_directory()?;
         Ok(())
+    }
+
+    fn persist_deferred_registrations(&self) -> io::Result<bool> {
+        let mut meta_wlock = self
+            .meta_informations
+            .write()
+            .expect("Managed file lock poisoned");
+        if !meta_wlock.registration_needs_persist {
+            return Ok(false);
+        }
+        save_managed_paths(self.directory.as_ref(), &meta_wlock)?;
+        meta_wlock.registration_needs_persist = false;
+        Ok(true)
     }
 
     /// Verify checksum of a managed file
@@ -296,6 +344,13 @@ impl Directory for ManagedDirectory {
 
     fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
         self.register_file_as_managed(path)?;
+        if self.registration_durability == ManagedFileRegistrationDurability::Deferred
+            && self.persist_deferred_registrations()?
+        {
+            // The upcoming atomic metadata write may make these paths durable
+            // references. Persist the manifest's directory entry first.
+            self.directory.sync_directory()?;
+        }
         self.directory.atomic_write(path, data)
     }
 
@@ -325,6 +380,7 @@ impl Directory for ManagedDirectory {
     }
 
     fn sync_pending_writes(&self) -> io::Result<()> {
+        self.persist_deferred_registrations()?;
         self.directory.sync_pending_writes()
     }
 }
@@ -334,6 +390,7 @@ impl Clone for ManagedDirectory {
         ManagedDirectory {
             directory: self.directory.box_clone(),
             meta_informations: Arc::clone(&self.meta_informations),
+            registration_durability: self.registration_durability,
         }
     }
 }
@@ -348,7 +405,11 @@ mod tests_mmap_specific {
 
     use tempfile::TempDir;
 
-    use crate::directory::{Directory, ManagedDirectory, MmapDirectory, TerminatingWrite};
+    use crate::core::{MANAGED_FILEPATH, META_FILEPATH};
+    use crate::directory::{
+        Directory, ManagedDirectory, ManagedFileRegistrationDurability, MmapDirectory,
+        TerminatingWrite,
+    };
 
     #[test]
     fn test_managed_directory() {
@@ -413,5 +474,40 @@ mod tests_mmap_specific {
             assert!(managed_directory.garbage_collect(|| living_files).is_ok());
         }
         assert!(!managed_directory.exists(test_path1).unwrap());
+    }
+
+    #[test]
+    fn deferred_registration_persists_before_the_durable_barrier() {
+        let tempdir = TempDir::new().unwrap();
+        let mmap_directory = MmapDirectory::open(tempdir.path()).unwrap();
+        let managed_directory = ManagedDirectory::wrap_with_registration_durability(
+            Box::new(mmap_directory.clone()),
+            ManagedFileRegistrationDurability::Deferred,
+        )
+        .unwrap();
+        let path = Path::new("deferred_component");
+
+        let mut writer = managed_directory.open_write(path).unwrap();
+        writer.write_all(b"component").unwrap();
+        writer.terminate().unwrap();
+
+        assert!(managed_directory.list_managed_files().contains(path));
+        assert!(mmap_directory.atomic_read(&MANAGED_FILEPATH).is_err());
+
+        managed_directory.sync_pending_writes().unwrap();
+
+        let persisted_paths: HashSet<PathBuf> =
+            serde_json::from_slice(&mmap_directory.atomic_read(&MANAGED_FILEPATH).unwrap())
+                .unwrap();
+        assert!(persisted_paths.contains(path));
+
+        managed_directory
+            .atomic_write(&META_FILEPATH, b"metadata")
+            .unwrap();
+        let persisted_paths: HashSet<PathBuf> =
+            serde_json::from_slice(&mmap_directory.atomic_read(&MANAGED_FILEPATH).unwrap())
+                .unwrap();
+        assert!(persisted_paths.contains(path));
+        assert!(persisted_paths.contains(&META_FILEPATH.to_path_buf()));
     }
 }

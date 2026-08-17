@@ -45,6 +45,7 @@ pub struct GarbageCollectionResult {
 pub use memmap2::Advice;
 
 pub use self::managed_directory::ManagedDirectory;
+pub(crate) use self::managed_directory::ManagedFileRegistrationDurability;
 #[cfg(feature = "mmap")]
 pub use self::mmap_directory::{MmapDirectory, MmapWriteDurability};
 
